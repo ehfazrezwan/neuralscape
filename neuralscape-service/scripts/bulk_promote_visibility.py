@@ -22,6 +22,13 @@ Usage:
     python scripts/bulk_promote_visibility.py --owner ehfaz --apply
 
 Direction can also be flipped with `--to private` to demote.
+
+Scope and limits: this rewrites the Qdrant payload only (``metadata.visibility``,
+plus ``owner_user_id`` when missing). It does not bump the memory revision and does
+not move the memory's Graphiti facts into the target visibility's graph group, so
+promoted rows are shared for vector recall while their graph facts stay in the
+group they were written under until the memory is re-enriched (edit it or
+re-ingest it). Run it once, when a single-user install becomes multi-user.
 """
 from __future__ import annotations
 

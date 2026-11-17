@@ -5,11 +5,14 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "neuralscape.labels" . | nindent 4 }}
+{{- /* Docling wiring follows docling.* so the app never points at a Deployment this
+       release did not create; a key in .Values.config wins. The ingest-storage
+       switch is NOT overridable: without a shared RWX volume (ingestStorage.enabled
+       =false) the API must not write artifacts to an unshared emptyDir the worker
+       can't read, so bytes ship through Redis instead. */}}
+{{- $cfg := mergeOverwrite (dict "DOCLING_ENABLED" (.Values.docling.enabled | toString) "DOCLING_URL" (printf "http://docling:%v" .Values.docling.port)) .Values.config }}
+{{- $_ := set $cfg "INGEST_STORAGE_ENABLED" (.Values.ingestStorage.enabled | toString) }}
 data:
-  {{- range $k, $v := .Values.config }}
+  {{- range $k, $v := $cfg }}
   {{ $k }}: {{ $v | quote }}
   {{- end }}
-  # Tie the app's artifact-storage mode to whether a shared RWX volume exists.
-  # Without one (ingestStorage.enabled=false) the API must NOT write artifacts to
-  # an unshared emptyDir the worker can't read — it ships bytes through Redis instead.
-  INGEST_STORAGE_ENABLED: {{ .Values.ingestStorage.enabled | quote }}

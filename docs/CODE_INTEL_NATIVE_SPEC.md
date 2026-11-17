@@ -1,4 +1,6 @@
-# F2 — Native Code-Intel Engine (DRAFT v1, 2026-07-05)
+# F2 — Native Code-Intel Engine (spec of 2026-07-05; shipped)
+
+> **Status (as of 2026-11-16, dev 6a81341f):** shipped, with a few unbuilt items. The native code-intel engine specified here is built. E1 through E7 shipped: the engine protocol (`adapters/code_graph/engine.py`), `NativeEngine` with its indexer, `locate`, anchors and memory enrichment, `detect_changes` with the dreaming liveness consumer (`extensions/dreaming/liveness.py`), snapshot export and import, and the index CLI; the MCP tools `locate`, `code_impact` and `code_graph_index` and their REST twins exist. The optional `code_cypher` read-only tool described below was not built. Treat the sequencing section as history; the current behavior is in the code and in [22-knowledge-adapters](./neuralscape/22-knowledge-adapters.md).
 
 Builds on the 2026-07-04 decision: absorb codebase-memory-mcp's *capabilities*
 and graphify's *semantics* onto NS-native storage instead of wrapping either
@@ -148,6 +150,8 @@ deployments the gate is simply "engine configured").
 
 ## Sequencing
 
+All of E1-E6 below have shipped (E7, the invocation surface for `index` and `code_impact`, was added afterwards). The list is kept as the order the work was built in.
+
 - **E1** — engine protocol + `GraphifyJsonEngine` wrapper. Pure refactor, zero
   behavior change, lands the seam. (Small; can ship independently.)
 - **E2** — native indexer + Neo4j label-space + parity on the 3 existing tools
@@ -165,3 +169,17 @@ refactor. E1 has no such dependency and can go first.
 - 158 languages; LSP-grade resolution; watching filesystems (index is
   pull/CI-driven); exposing raw Cypher to normal users; mirroring the raw code
   graph into Graphiti (F1's hard rule stands).
+
+## Server-side repositories only (by design)
+
+Code indexing is operator-side. Every engine (native, graphify-lib, CBM) reads the
+repository from the NeuralScape server's own disk, resolved through `CODE_REPOS`
+(a JSON object of repo name to directory, for example
+`CODE_REPOS='{"demo": "/srv/repos/demo"}'`). The `code_space` is `code--<owner>--<repo>`
+and its repo segment must be a key in `CODE_REPOS`. There is no upload or clone path:
+`POST /v1/code-graph/index` / MCP `code_graph_index` with a repo that is not mapped
+ends the task with `ok: false` and an error naming `CODE_REPOS`. A laptop client that
+wants code answers over a repo the server cannot see uploads a Graphify bundle
+(`graph.json`) through `POST /v1/ingest/files` instead.
+
+`CODE_REPOS` is global by design: any authenticated user may index any mapped repo into their own `code--<owner>--<repo>` space (the operator decides what is mapped). Owner and repo segments must not contain `--` or start/end with `-`; a space owned by someone else can only be indexed, read or deleted by an admin.

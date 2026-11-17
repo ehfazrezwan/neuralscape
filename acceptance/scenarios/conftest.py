@@ -25,6 +25,8 @@ RUN_LAST = {
     "test_edit_delete": 2,
     "test_delete_privacy": 3,  # bulk-deletes ctx.project_id
     "test_fault_injection": 4,
+    "test_graph_leg_budget": 5,  # pauses Neo4j briefly
+    "test_backup_restore": 6,  # wipes every store, then restores a backup: after everything else, fault injection and the Neo4j pause included
 }
 
 
@@ -57,7 +59,10 @@ def check_search_finds_marker(client, fact: Fact) -> None:
 
 @pytest.fixture(scope="session")
 def a_fact(ctx, a) -> Fact:
-    marker = f"zq-{ctx.run_id}-marker"
+    # The profile is part of the marker: a gate pins one run id across every profile of a run and a write's job
+    # id is derived from its content, so a later profile re-submitting the same text would be answered with the
+    # earlier profile's finished job (still in Redis) and never store the fact in its own fresh stores.
+    marker = f"zq-{ctx.run_id}-{ctx.profile}-marker"
     fact = Fact(
         marker=marker,
         content=(

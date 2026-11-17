@@ -291,6 +291,11 @@ class TestProcessMemoryRaw:
 class TestProcessGraphEnrichment:
     @pytest.mark.asyncio
     async def test_calls_enrich_graph(self, ctx):
+        # The job re-reads the row and enriches its CURRENT state; an unset mock
+        # row would feed MagicMock attributes into the group id.
+        ctx["service"].get_memory.return_value = MemoryResponse(
+            id="mem-1", memory="hello", visibility="shared", project_id="proj"
+        )
         await worker.process_graph_enrichment(
             ctx, memory_id="mem-1", content="hello", user_id="ehfaz",
             project_id="proj", visibility="shared",
@@ -302,6 +307,7 @@ class TestProcessGraphEnrichment:
 
     @pytest.mark.asyncio
     async def test_defaults_visibility_to_private(self, ctx):
+        ctx["service"].get_memory.return_value = MemoryResponse(id="m", memory="c")  # legacy: no visibility
         await worker.process_graph_enrichment(ctx, memory_id="m", content="c", user_id="u")
         assert ctx["service"].enrich_graph.call_args[1]["visibility"] == "private"
 
@@ -613,3 +619,27 @@ class TestWorkerSettings:
         """The expire-old-memories cron must be registered."""
         cron_fns = [c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs]
         assert "expire_old_memories_cron" in cron_fns
+
+
+class TestVectorRepairCron:
+    def test_registered_on_the_graph_worker_only(self):
+        assert "repair_stale_vectors_cron" in {c.coroutine.__name__ for c in worker.GraphWorkerSettings.cron_jobs}
+        assert "repair_stale_vectors_cron" not in {c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs}
+
+    @pytest.mark.asyncio
+    async def test_calls_the_service_repair(self, ctx):
+        ctx["service"].repair_stale_vectors.return_value = {"scanned": 2, "repaired": 2, "failed": 0}
+        assert await worker.repair_stale_vectors_cron(ctx) == {"scanned": 2, "repaired": 2, "failed": 0}
+        ctx["service"].repair_stale_vectors.assert_called_once()
+
+
+class TestReenrichSweepCron:
+    def test_registered_on_the_graph_worker_only(self):
+        assert "graph_reenrich_sweep_cron" in {c.coroutine.__name__ for c in worker.GraphWorkerSettings.cron_jobs}
+        assert "graph_reenrich_sweep_cron" not in {c.coroutine.__name__ for c in worker.WorkerSettings.cron_jobs}
+
+    @pytest.mark.asyncio
+    async def test_calls_the_service_sweep(self, ctx):
+        ctx["service"].sweep_pending_reenrichments.return_value = {"scanned": 3, "reenriched": 2, "failed": 1}
+        assert await worker.graph_reenrich_sweep_cron(ctx) == {"scanned": 3, "reenriched": 2, "failed": 1}
+        ctx["service"].sweep_pending_reenrichments.assert_called_once()

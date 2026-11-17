@@ -10,6 +10,7 @@ import logging
 import time
 
 from arq.connections import ArqRedis, create_pool
+from arq.constants import result_key_prefix
 from arq.jobs import Job, JobStatus
 
 from config import parse_redis_settings, settings
@@ -212,18 +213,20 @@ class TaskManager:
 
         Uses a deterministic job ID based on content hash to prevent
         duplicate enqueues of the same conversation. ``occurred_at`` (event
-        time, for historical ingestion of old chat exports) is part of the
-        key when present — the same transcript imported with a different
-        event time is a distinct job, not a duplicate; the plain path's job
-        ids are unchanged.
+        time, for historical ingestion of old chat exports), ``project_id``,
+        ``agent_id`` and ``run_id`` are part of the key: the same text sent to
+        another project, agent or run (or imported with another event time)
+        is a distinct job, not a duplicate. A retry of the identical request
+        still derives the identical id.
         """
         # Generate deterministic job ID from message content
         content_str = "|".join(
             m.get("content", "") for m in messages
         )
-        key = f"store:{content_str}"
-        if occurred_at:
-            key = f"store:{occurred_at}:{content_str}"
+        key = (
+            f"store:{occurred_at or ''}:{_scope_key(project_id=project_id, agent_id=agent_id, run_id=run_id)}"
+            f":{content_str}"
+        )
         job_id = _generate_job_id(key, user_id)
 
         job = await self.pool.enqueue_job(
@@ -274,6 +277,8 @@ class TaskManager:
         # Data-layer connectors
         memory_kind: str | None = None,
         source_ref: dict | None = None,
+        # Workspace partition: absent / "memory" = memory workspace.
+        workspace: str | None = None,
         # Durable path only (LEDGER_ENABLED): accepted and unused until writes use the ledger.
         idempotency_key: str | None = None,
     ) -> str:
@@ -297,9 +302,37 @@ class TaskManager:
         must not coalesce onto one job id — that would let an override-on
         request silently absorb (and skip) an override-off request for the
         same content, or vice versa.
+
+        Everything else that changes what is stored is in the key too
+        (category, tags, agent, run, and the v2 / provenance fields), so two
+        writes of the same text that differ in any of them are distinct jobs.
+        Tags are compared as a set. A retry of the identical request derives
+        the identical id.
         """
+        options = _scope_key(
+            category=category,
+            tags=sorted(set(tags)) if tags else None,
+            agent_id=agent_id,
+            run_id=run_id,
+            domain=domain,
+            observation_type=observation_type,
+            concepts=sorted(set(concepts)) if concepts else None,
+            source_type=source_type,
+            related_memory_ids=sorted(set(related_memory_ids)) if related_memory_ids else None,
+            confidence=confidence,
+            expires_at=expires_at,
+            occurred_at=occurred_at,
+            derived_from=sorted(set(derived_from)) if derived_from else None,
+            epistemic_level=epistemic_level,
+            memory_kind=memory_kind,
+            source_ref=source_ref,
+            # store_raw's dedup identity includes the workspace, so the same
+            # text written to another workspace is a distinct job.
+            workspace=workspace,
+        )
         job_id = _generate_job_id(
-            f"raw:{visibility}:{scope}:{project_id}:{sensitivity_override}:{content}", user_id
+            f"raw:{visibility}:{scope}:{project_id}:{sensitivity_override}:{options}:{content}",
+            user_id,
         )
 
         v2_extras = {
@@ -317,6 +350,7 @@ class TaskManager:
             "sensitivity_override": sensitivity_override,
             "memory_kind": memory_kind,
             "source_ref": source_ref,
+            "workspace": workspace,
         }
         # Drop None values so the worker signature can default cleanly
         v2_extras = {k: v for k, v in v2_extras.items() if v is not None}
@@ -354,8 +388,12 @@ class TaskManager:
         visibility = doc.get("visibility")
         adapter = doc.get("adapter", "default")
         partition = doc.get("user_id") or "ingest"
+        workspace = doc.get("workspace")
         job_id = _generate_job_id(
-            f"ingest:{visibility}:{adapter}:{connector_id}:{content}", partition
+            f"ingest:{visibility}:{adapter}:{connector_id}:"
+            + (f"ws={workspace}:" if workspace else "")
+            + content,
+            partition,
         )
 
         job = await self.pool.enqueue_job(
@@ -385,12 +423,14 @@ class TaskManager:
         visibility = options.get("visibility")
         adapter = options.get("adapter", "default")
         page_offset = options.get("page_offset") or 0
+        workspace = options.get("workspace")
         content_key = (payload.get("source_ref") or {}).get("external_id") or payload.get(
             "stored_path"
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
             f"ingest-file:{visibility}:{adapter}:{page_offset}:"
-            f"{payload.get('filename', '')}:{content_key}",
+            + (f"ws={workspace}:" if workspace else "")
+            + f"{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(
@@ -420,7 +460,9 @@ class TaskManager:
         ) or payload.get("data_b64", "")
         job_id = _generate_job_id(
             f"ingest-okf:{options.get('visibility')}:{options.get('scope')}:"
-            f"{options.get('project_id')}:{payload.get('filename', '')}:{content_key}",
+            f"{options.get('project_id')}:"
+            + (f"ws={options.get('workspace')}:" if options.get("workspace") else "")
+            + f"{payload.get('filename', '')}:{content_key}",
             partition,
         )
         job = await self.pool.enqueue_job(
@@ -476,13 +518,7 @@ class TaskManager:
         cached job, result or read grant with the previous instance.
         """
         job_id = connector_sync_job_id(connector_id, user_id, generation)
-        job = await self.pool.enqueue_job(
-            "process_connector_sync",
-            connector_id,
-            generation,
-            _job_id=job_id,
-            _queue_name=settings.ingest_queue_name,
-        )
+        job = await enqueue_connector_sync_job(self.pool, connector_id, generation, job_id)
         task_id = job_id if job is None else job.job_id
         await self._track_task(user_id, task_id)
         return task_id
@@ -701,6 +737,35 @@ class TaskManager:
             "error": error,
         }
 
+    def job_owner(self, tenant_id: str, task_id: str):
+        """The principal an accepted job is bound to (synchronous; used by the enforcer).
+
+        A durable intent names its submitting subject in the ledger (only on the
+        governed path, where intents carry the bound principal).  A legacy queue job
+        is mapped to the submitting user through the short-lived task→user key the
+        enqueue path records.  Unknown or unreadable is ``None`` (no access through it).
+        """
+
+        from policy_enforcement import JobOwner
+
+        if task_id.startswith("intent-"):
+            producer = self.producer
+            if self.ledger is None or producer is None or producer.principals is None:
+                return None
+            stored = self.ledger.get_intent(tenant_id, task_id)
+            return None if stored is None else JobOwner(subject_id=stored.intent.actor_id)
+        import redis
+
+        client = self._owner_client
+        if client is None:
+            client = self._owner_client = redis.Redis.from_url(
+                settings.redis_url, socket_timeout=2, socket_connect_timeout=2
+            )
+        user = client.get(_task_user_key(task_id))
+        if not user:
+            return None
+        return JobOwner(user_id=user.decode() if isinstance(user, bytes) else str(user))
+
     async def wait_for_result(self, task_id: str, timeout: float = 300.0) -> dict:
         """Wait for a task to complete and return its status.
 
@@ -799,6 +864,38 @@ class TaskManager:
             self.producer = self.ledger = self.authority = None
 
 
+async def enqueue_connector_sync_job(pool, connector_id: str, generation: str | None, job_id: str):
+    """Enqueue a connector sync under ``job_id``, coalescing only with a run still in flight.
+
+    Returns the new job, or ``None`` when the sync was coalesced onto a run that
+    is queued, deferred or running. ARQ refuses an id whose result is still
+    cached (an hour after it finished), so with a deterministic id a sync
+    requested after the previous one completed would be silently dropped and a
+    poller would read the previous run's result. For a finished run the cached
+    result is cleared and a fresh job is enqueued; a client still polling the
+    old run with the same id sees the new run's state instead of the old result.
+    Shared by ``TaskManager.enqueue_connector_sync`` and ``connector_sync_cron``.
+    """
+
+    async def _enqueue():
+        return await pool.enqueue_job(
+            "process_connector_sync",
+            connector_id,
+            generation,
+            _job_id=job_id,
+            _queue_name=settings.ingest_queue_name,
+        )
+
+    job = await _enqueue()
+    if job is not None:
+        return job
+    status = await Job(job_id, pool, _queue_name=settings.ingest_queue_name).status()
+    if status != JobStatus.complete:
+        return None  # queued / deferred / running: coalesce onto it
+    await pool.delete(result_key_prefix + job_id)
+    return await _enqueue()
+
+
 def connector_sync_job_id(
     connector_id: str, owner_user_id: str | None, generation: str | None
 ) -> str:
@@ -814,6 +911,20 @@ def connector_sync_job_id(
         "\x1f".join([owner_user_id or "", generation or ""]).encode()
     ).hexdigest()[:16]
     return f"sync-{connector_id}-{instance}"
+
+
+def _scope_key(**fields) -> str:
+    """Canonical, order-independent text for the optional fields of a job key.
+
+    Unset (None) fields are omitted so a request that leaves them out derives
+    the same text whichever way the caller spelled "not given".
+    """
+    return json.dumps(
+        {k: v for k, v in fields.items() if v is not None},
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
 
 
 def _generate_job_id(content: str, user_id: str) -> str:

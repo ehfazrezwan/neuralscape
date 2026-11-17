@@ -101,7 +101,12 @@ def fulltext_query(query: str, group_ids: list[str] | None, driver: GraphDriver)
     for f in group_ids_filter_list:
         group_ids_filter += f if not group_ids_filter else f' OR {f}'
 
-    group_ids_filter += ' AND ' if group_ids_filter else ''
+    # NEURALSCAPE PATCH (re-apply after upstream subtree syncs): the OR of group
+    # filters must be parenthesised. Lucene reads `a OR b AND (q)` as `a +b +(q)`,
+    # so with several group ids only the LAST one was required to match and a
+    # fulltext leg silently missed every document in the other groups.
+    if group_ids_filter:
+        group_ids_filter = '(' + group_ids_filter + ') AND '
 
     lucene_query = lucene_sanitize(query)
     # If the lucene query is too long return no query

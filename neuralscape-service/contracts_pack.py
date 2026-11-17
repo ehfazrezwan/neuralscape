@@ -83,6 +83,7 @@ MODULE_OWNERS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
     "contracts_usage_reconcile": ("usage", ("usage",), ("usage",)),
     "contracts_context": ("context", ("context",), ("clients", "lifecycle")),
     "contracts_freshness": ("context", ("lifecycle", "context"), ("clients", "context")),
+    "onboarding": ("policy", ("policy",), ("clients", "tenancy")),
     "engine_ports": ("engines", ("engines",), ("lifecycle", "portability", "context", "usage")),
 }
 
@@ -95,9 +96,9 @@ MODULE_OWNERS: dict[str, tuple[str, tuple[str, ...], tuple[str, ...]]] = {
 # registry test, whatever it is called.
 NON_PRODUCT_MODULES: dict[str, tuple[str, tuple[str, ...]]] = {
     "evidence_records": (
-        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes; "
-        "harness output, not a service wire contract",
-        ("persona_evidence",),
+        "machine-readable evidence records, writer and baseline/candidate comparison for the persona probes and "
+        "the preservation run harness; harness output, not a service wire contract",
+        ("persona_evidence", "comp1_run"),
     ),
 }
 
@@ -2102,7 +2103,8 @@ def valid_examples() -> dict[str, dict]:
 
 # Pinned digests of the generated schemas of this revision (see module doc).
 SCHEMA_DIGESTS: dict[str, str] = {
-    "AccessPolicy": "b1ec9292d59a81dd199efd000ce6d2fb87eee567ff999ae618ba75f2a804ce43",
+    "AccessPolicy": "188d273bc4ee873b54b6a3ae9d001ffa8ac066d1890a74322861baa716993ded",
+    "ActivationReceipt": "b93f9a7436fd18abb75d5ce21f503736133e0d0ed2ad4288d85001e7de5f190f",
     "AssemblyStageTiming": "354ca825e78dfb8fda5e216f0fdf47ff8c6eb3ad14b523ede55aad52b0a2b341",
     "AttemptUsage": "de5fe29c644755666e4cc15d2146dd73438c42b8be16023c558bb8452a2c8540",
     "AttributionSnapshot": "a5187e6340c911fc3765a36c7f7790ec0a002e19873a0b64aa0e1589cf55cd40",
@@ -2129,37 +2131,46 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "DeclaredOmission": "8844bda0d5894a61283a242da6c1356972b4bc019d9c6c12e419c9a1aa0c92de",
     "DelegationConstraints": "ee08aba3475eab02a4789a18a5336a241903e7334db4212866f7b4e672fc7b89",
     "EncryptionReference": "cc3a6afbf5d4494d1b415d8b6ed7c8d15e5fa27a8788dec1ae1ee19809f47b77",
+    "EngineRecord": "aa85a3dde5cf6a7529db179663b14e05569241718259d58ded17a179ddec2e7d",
     "ExpansionLineage": "c9432f97738fe9cdc2240a83202edd1068d01965ffd4fe8c0d6795d3dca6b727",
     "ExportScope": "ad62aa653584296184252dbade31a1ee5fba7095cecbdd6cb3390ea456e6f6a5",
     "FreshnessWitness": "faffe48bfa79a879a02a80dfb80d35b451b645d459c198c3df78344d2b24f213",
     "GenerationProposal": "0028690353d6d9d8061a3d1b40a2061247a27b47091cbcc644786f1c098c767f",
     "GenerationRequest": "077e0b6c987083bf85b9d82065e296bd09bd27e5617ae50590611f0fcf2fd407",
     "GenerationResult": "14ea6463cf6dfd2b4f23687a0da9c3004bbf81f5ae01e99b2f757008b6727be2",
+    "GraphEdge": "fd04fd55cff9f2aded9b7467224e0c9eb725a08be837d5a92486a7cc0b33abbc",
+    "GraphEpisode": "a2d9a47ac6ef448d82978c6614110c5a64f6de25af16c9e761c9e46d1a666863",
     "IdentityMapping": "db567dd5a4c5c77928e7f85e1029ae65444a913377a5c2d66ad6eb062fa0a878",
     "InferenceResourceLimits": "61b0e705dcfa15eaabc50534bd6b45891a2bcbe8abfca94512b5f4b1f58d2867",
     "Intent": "73a627d682d7533af580901b9aa3c2d45822112db58c0abcbe26aa0e593c6741",
     "ManifestFile": "d0fcd247d8d2c280f5d8645e915f9a171a00b0a4382bbc6ea5e3a988a044c40c",
     "MembershipVersion": "090001b44c8269177f4fd9ed5eaf289e56e2243d29a2c98849855ef66b3bfe0b",
     "MemoryRecord": "3f3706186d8906c3cd4f3c02b0fb969fe7868c0c2263e1433303587ee7e09d4d",
+    "OnboardingPolicy": "ac284255170787b6e6374bc15fada560887171894b375e8bec48889a937b86f2",
     "OpaqueEnvelopeBody": "5735bd4c041aaef025cd825d7c0fdae1d0097c99e247f7061628cdcabe36addf",
+    "OperationContext": "41d96e75bd41f3d6f72416eaeed5076dd875d58335d7778841c81e05b16e0d2e",
     "PlaintextBody": "a779dc91b1e4ab61dca0bb4f99b14f467f124e7fbf28717b71da2dabab087234",
+    "PolicyCondition": "546a5518de4e170c23800e4877c7a1f1f2bbb97c5ca58a646e658842d1cd7811",
     "PolicyDecision": "dbfbcdcf7785c25943ddcf68df8449d3ff862f91b81cf804e0219dedf3c31791",
-    "PolicyEvaluationInput": "4a21dea79896e28faadce052e3256616ac45317fb06910939b4b0c4c2ebfd3f3",
-    "PolicyStatement": "719e5a23c3e6a6f6147079826e52a9943d6bfecab3311ae248ae848c5286a8b3",
+    "PolicyEvaluationInput": "b5f3fdc1df65eff4c49c1ca290b30bd9dc4c5787652bc4a442712d0a83d23c0f",
+    "PolicyStatement": "0d60d9c33b5fdbac3927c9c90e3e6e3d2dd899bb7a52bcc22bd46d2e3e21d692",
     "PortableManifest": "0a77d59b8747e11736ee59cd5079fe4cb3073def1dad1d479e9f87699a099c7c",
     "PositionReference": "dd83ce1d7277e99ddc45aff2447c6439eac67c6defc8fea8a954a297e80ce06f",
     "PrincipalContext": "a6996c742cbd4bee745555201b8db76ab2a3fb616fd40e6545e7b67e1675ca4c",
     "ProcessingPolicy": "9a304d12012cfdb36cf58ee6f5137c05fe1e58f6ce1d582d294ff75fcb465975",
     "ProducerReference": "6aabc3d2e1e769b39fc7e02f8ba636d46096b1f68f9b9bc9234b989b4a7bfe7b",
     "ProjectionFreshness": "3b2e025e69b5002803f844e367c1d24e99e3b893c950b0f2d0c9ae2d6618fc72",
+    "ProjectionReceipt": "37b01000113b9821ccf8cc8538f651a02c9f46552a5ab9e0d1cf81c2c63a032a",
     "PublicError": "abe3fd61b806b9fa810ff5bd21d05e11dfa3ff12837ae4ff6d4d2d90e5400db9",
     "QualificationClaim": "4f0c979c63bae0f0716643d2b54c30c76d116f6229ef26f7f9e672ad7343f048",
     "ReconciledLedger": "89c1d31ee79049eb510faad3c4e902261bd4d89d8585cf16e23c4ffd967b6569",
     "ReconciledUsageStream": "b4c442414c15efc371685d15b46d88383f3b109596f9361b8ea2a4113705ee63",
     "ReferenceHandle": "1e94f946c4e4eb9565e8159e5fa3bddb04937730c79e03d5974faaa6f72011b8",
     "ResourceCompliance": "70d378b94fae539a8828758c829a072955de8f6cb183a85197210c422a3aca59",
+    "ResourceContext": "607013e2b5ce0879fe5fddb8abfd509db3c751e52049ee38b3c7a6c00ca54e05",
     "ResourceManifestReference": "d1f1a73436e66c4991fe8d4f359d8608c2bffcf97507fe1fe256bc1a927e26c4",
     "ScoreDistribution": "b669c910f60ea64b670cb49f2e5d4983c31db737370a96a483009390437ca041",
+    "SearchHit": "5615c9917025e6a12bf5787e44a5632aafe8cc3a0618dba289f60c4ec4b2c117",
     "SelectedContextItem": "21539b103b690d8a93dc07b33797620434bdd112e62c42d9b7f9b0cee6475e1f",
     "SerializedResponseBudget": "c82460b5a38dd9bcb89a9eaca0cf958a76585046cbd6b0e1f219f18a4867e370",
     "SerializedResponseUsage": "3651b7232f55bd8cfdbfcb9e1b4e243067963fd9b48e63380d1a0916bfb6c279",
@@ -2171,6 +2182,7 @@ SCHEMA_DIGESTS: dict[str, str] = {
     "StageError": "d17d77549510a313a01e70803404515e53c7c4a091f60ebd3655dfb54d368c3a",
     "StageEvidenceRequirement": "5952b3cb871ebf4546af9d295b627056f839a5166911d440c2b0f75910a5d44b",
     "StageReceipt": "95c1611c79aba0d67763b94330e48ded94204b79dd1a52bd3d34183e8d541441",
+    "TenantFilter": "5fc1c6a653be897863924dc6d4761f49a62aa5241d1b18c5e37842c20742bd11",
     "TenantOperationState": "33db3798d46fa950f351e1873a2bde88bf2eb38b1cc6f273a4af0e77e25807e9",
     "TenantPlacement": "115d2cb1e7dc14f7c47cf0e33534200124e9548b7dbbfe1250467b44831e3643",
     "TenantReadinessPublication": "fa46b169c2252b127a66be0ed184f330838ab8be2e80be7a4f8b52920da792db",

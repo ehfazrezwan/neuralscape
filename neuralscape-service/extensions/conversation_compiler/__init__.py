@@ -181,35 +181,17 @@ class ConversationCompilerExtension:
         if not content or not category:
             return None
 
-        from schemas import (
-            MemoryVisibility,
-            default_visibility_for_category,
-            normalize_visibility,
-        )
+        from .flush import mirror_to_vault
 
-        visibility_raw = payload.get("visibility")
-        if visibility_raw is None:
-            resolved_visibility = default_visibility_for_category(category)
-        else:
-            # ``normalize_visibility`` tolerates the legacy
-            # "MemoryVisibility.SHARED" stringified-enum format from the
-            # pre-fix str(Enum) bug — older memories stored in Qdrant
-            # before the __str__ override still parse cleanly here, so
-            # the backfill script can replay events for every stored
-            # memory without crashing on broken visibility values.
-            try:
-                normalized = normalize_visibility(visibility_raw)
-                resolved_visibility = (
-                    MemoryVisibility(normalized) if normalized
-                    else default_visibility_for_category(category)
-                )
-            except (ValueError, TypeError):
-                logger.warning(
-                    "Unknown visibility %r — defaulting per category",
-                    visibility_raw,
-                )
-                resolved_visibility = default_visibility_for_category(category)
-        if resolved_visibility != MemoryVisibility.SHARED:
+        # Private memories never reach the vault (multi-user privacy), except
+        # conversation-extracted rows, whose private stamp is decided by the
+        # category's tier (see ``mirror_to_vault``).
+        if not mirror_to_vault(
+            category,
+            payload.get("visibility"),
+            extracted=bool(payload.get("extracted")),
+            sensitivity=payload.get("sensitivity"),
+        ):
             return None
 
         created_at_raw = payload.get("created_at")
@@ -231,6 +213,7 @@ class ConversationCompilerExtension:
                     "category": category,
                     "content": content,
                     "session_id": session_id,
+                    "user_id": payload.get("user_id", ""),
                 }
             ])
             return {"vault_path": cat_path}

@@ -37,6 +37,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from memory.groups import _build_group_id
+
 from .prompts import CONSOLIDATION_PROMPT, parse_json_object, render_memories_block
 from .scoring import score_memory
 from .traces import read_aggregates, read_dynamics
@@ -74,6 +76,9 @@ class ActionResult:
     applied: list[dict] = field(default_factory=list)
     reported: list[dict] = field(default_factory=list)   # shadow trial: not applied
     errors: list[str] = field(default_factory=list)
+    # Staged actions not applied because the rows changed under the sweep
+    # (e.g. a MERGE row was tombstoned after staging). Not errors.
+    skipped: list[dict] = field(default_factory=list)
 
 
 # ── Pool enumeration + LIGHT staging ────────────────────────────────
@@ -81,15 +86,11 @@ class ActionResult:
 
 def pool_key(*, visibility: str, owner_user_id: str | None, project_id: str | None, workspace: str | None = None) -> str:
     """Derive the pool key for a memory row (mirrors graph group_id + WT6 workspace suffix)."""
+    # Same builder as the write side, so a pool key IS the graph group_id (flag on: injective names).
+    # Anything but "shared" is a private pool, as before.
     if visibility == "shared":
-        base = f"shared--project--{project_id}" if project_id else "shared"
-    else:
-        uid = owner_user_id or "unknown"
-        base = f"user--{uid}--project--{project_id}" if project_id else f"user--{uid}"
-    # Workspace suffix (WT6): absent or "memory" ⇒ no suffix (backward compatible)
-    if workspace and workspace != "memory":
-        return f"{base}--ws--{workspace}"
-    return base
+        return _build_group_id("shared", "", project_id, workspace)
+    return _build_group_id("private", owner_user_id or "unknown", project_id, workspace)
 
 
 # Audit 27 #29: the enumeration scroll pulls ONLY the fields the cheap
@@ -511,6 +512,32 @@ async def apply_actions(
                 result.applied.append({**act, "dry_run": True})
                 continue
             a_type = act["type"]
+            # Re-read the tombstone state of every row this action writes to,
+            # right before applying: another writer (semantic dedup) may have
+            # tombstoned one since the action was staged, and writing into a
+            # hidden row (a reframe, a merge) or re-tombstoning it (overwriting
+            # dedup's superseded_by pointer) would undo or bury dedup's work.
+            # The one exemption is the hard delete of a gate-cleared secret.
+            if not (
+                a_type == "prune"
+                and act.get("contains_secret")
+                and not act.get("secret_claim_downgraded")
+            ):
+                touched = list(dict.fromkeys([
+                    *(act.get("memory_ids") or []),
+                    *([act["survivor_id"]] if a_type == "merge" else []),
+                    # an invalidate points its rows at the row that replaces them
+                    *([act["superseded_by_id"]]
+                      if a_type == "invalidate" and act.get("superseded_by_id") else []),
+                ]))
+                hidden = await asyncio.to_thread(_tombstoned_ids, service, touched)
+                if hidden:
+                    result.skipped.append({
+                        "type": a_type,
+                        "memory_ids": list(act.get("memory_ids") or []),
+                        "skip_reason": "tombstoned since staging: " + ",".join(sorted(hidden)),
+                    })
+                    continue
             if a_type == "merge":
                 survivor = act["survivor_id"]
                 losers = [m for m in act["memory_ids"] if m != survivor]
@@ -590,6 +617,20 @@ async def _enqueue_delete_sibling_jobs(deleted) -> None:
 # ── Apply primitives (Qdrant + graph) ───────────────────────────────
 
 
+def _encode_sparse_with_retry(vs, text: str, attempts: int = 3):
+    """``vs._encode_bm25`` (swallows its own errors, returns None) with a short retry."""
+    import time
+
+    for i in range(attempts):
+        sparse = vs._encode_bm25(text)
+        if sparse is not None:
+            return sparse
+        if vs._get_bm25_encoder() is None:
+            return None  # permanently unavailable: retrying cannot help
+        time.sleep(0.2 * (i + 1))
+    return None
+
+
 def _rewrite_content(
     service,
     memory_id: str,
@@ -599,22 +640,46 @@ def _rewrite_content(
     derived_from_add: list[str] | None = None,
     extra_meta: dict | None = None,
 ) -> None:
-    """Update a memory's text in place: re-embed + overwrite payload data.
+    """Update a memory's text in place: re-embed + re-encode BM25 + patch.
 
-    Atomic from the reader's perspective (single upsert). ``updated_at``
-    and the dreaming provenance markers ride along in metadata.
+    Never a whole-point upsert. An upsert replaces the point, which (1)
+    dropped the BM25 sparse vector the write path stores next to the dense
+    one (``{"": dense, "bm25": sparse}``), so every rewritten row lost its
+    lexical retrieval leg, and (2) overwrote the whole payload from a stale
+    snapshot, losing a concurrent ``times_derived`` bump or tombstone.
+    Instead, mirroring ``_tombstone`` / ``_revive_if_tombstoned``:
+
+    * nested-key ``set_payload(key="metadata")`` merges ONLY the keys this
+      rewrite owns (undo stash, markers, derived_from union, ``extra_meta``);
+    * top-level ``set_payload`` sets ``data`` / ``hash`` / ``updated_at``;
+    * ``update_vectors`` replaces the dense vector and, when the collection
+      has the slot, the BM25 sparse vector, via the vector store's own
+      ``_encode_bm25`` (no re-implementation of the encoding).
+
     ``derived_from_add`` (MERGE) unions premise ids into the survivor's
-    ``metadata.derived_from`` — read-merge-write like ``_tombstone``, but
-    folded into this upsert so provenance and content land atomically.
-    Any ``extra_meta`` patch (e.g. the merge branch's summed
-    ``times_derived``) lands in the same upsert too.
+    ``metadata.derived_from`` (read once, written as a single key). The
+    merge branch's summed ``times_derived`` arrives through ``extra_meta``.
+    The metadata patch lands first so the undo stash exists before the
+    visible text flips; ``data`` is written last.
+
+    Atomicity is per key, not one transaction: the steps are separate Qdrant
+    calls, so a failure part-way leaves a partly updated row (for example a
+    new undo stash with the old text). Every step only adds or replaces keys
+    this rewrite owns, so a retry (the sweep re-flags the row) converges and
+    nothing another writer set is ever overwritten. If the BM25
+    encoder fails on the new text (after retries) the rewrite is refused
+    before any write; if the encoder is permanently unavailable the row's
+    sparse vector is dropped. A sparse vector derived from the old text is
+    never left on a rewritten row.
     """
     from config import settings as core_settings
 
     m = service._get_memory()
-    client = m.vector_store.client
+    vs = m.vector_store
+    client = vs.client
+    collection = core_settings.qdrant_collection
     points = client.retrieve(
-        collection_name=core_settings.qdrant_collection,
+        collection_name=collection,
         ids=[memory_id],
         with_payload=True,
         with_vectors=False,
@@ -622,25 +687,25 @@ def _rewrite_content(
     if not points:
         raise ValueError(f"memory {memory_id} not found for rewrite")
     payload = dict(points[0].payload or {})
-    meta = dict(payload.get("metadata") or {})
+    existing_meta = payload.get("metadata") or {}
+    patch: dict = {}
     # Audit 27 #26: rewrites must be reversible. Stash the pre-rewrite text
     # as one level of undo (a newer rewrite overwrites an older stash). A
     # no-op rewrite (identical text) keeps the existing stash — clobbering
     # it with a copy of the current text would destroy the undo point.
     prev_content = payload.get("data")
     if prev_content and prev_content != new_content:
-        meta["dream_prev_content"] = prev_content
-    meta["dream_rewritten_at"] = datetime.now(timezone.utc).isoformat()
+        patch["dream_prev_content"] = prev_content
+    patch["dream_rewritten_at"] = datetime.now(timezone.utc).isoformat()
     if reframed:
-        meta["dream_temporal_reframed"] = True
+        patch["dream_temporal_reframed"] = True
     if derived_from_add:
-        existing = meta.get("derived_from") or []
+        existing = existing_meta.get("derived_from") or []
         # union, order-preserving (existing premises first), dedup'd
-        meta["derived_from"] = list(dict.fromkeys([*existing, *derived_from_add]))
+        patch["derived_from"] = list(dict.fromkeys([*existing, *derived_from_add]))
     if extra_meta:
-        meta.update(extra_meta)
-    payload["metadata"] = meta
-    payload["data"] = new_content
+        patch.update(extra_meta)
+
     # Audit 27 #6: the content hash MUST follow the content. A stale hash
     # corrupts write-path dedup (a re-store of the new text isn't caught;
     # a re-store of the OLD text wrongly short-circuits onto this row) and
@@ -648,15 +713,57 @@ def _rewrite_content(
     # "duplicates". Same helper as store_raw — never a re-implementation.
     from memory_service import content_hash
 
-    payload["hash"] = content_hash(new_content)
-    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
-    vector = m.embedding_model.embed(new_content, memory_action="update")
-    from qdrant_client.models import PointStruct
+    top_level = {
+        "data": new_content,
+        "hash": content_hash(new_content),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    dense = m.embedding_model.embed(new_content, memory_action="update")
 
-    client.upsert(
-        collection_name=core_settings.qdrant_collection,
-        points=[PointStruct(id=memory_id, vector=vector, payload=payload)],
+    from qdrant_client.models import PointVectors
+
+    drop_stale_bm25 = False
+    if getattr(vs, "_has_bm25_slot", False) is True:
+        sparse = _encode_sparse_with_retry(vs, new_content)
+        if sparse is None and vs._get_bm25_encoder() is not None:
+            # The encoder exists but failed on this text (transient). Writing
+            # now would either drop the row's lexical leg or leave the OLD
+            # text's sparse vector: refuse BEFORE any write. The row stays
+            # consistent (old text, old vectors), the action is reported as an
+            # error, and the next sweep retries.
+            raise RuntimeError(f"bm25 encoding failed for {memory_id}; rewrite not applied")
+        vector: object = {"": dense, "bm25": sparse} if sparse is not None else {"": dense}
+        if sparse is None:
+            # Encoder permanently unavailable: lexical recall is already dead
+            # for every row (new writes get no sparse vector either). Drop this
+            # row's sparse vector below rather than leave one derived from the
+            # OLD text, which the rewrite may have removed on purpose.
+            drop_stale_bm25 = True
+            logger.warning(
+                "BM25 encoder unavailable; rewrite of %s updates the dense vector "
+                "and drops its stale sparse vector", memory_id,
+            )
+    else:
+        vector = dense
+
+    client.set_payload(
+        collection_name=collection, payload=patch, points=[memory_id], key="metadata",
     )
+    client.update_vectors(
+        collection_name=collection,
+        points=[PointVectors(id=memory_id, vector=vector)],
+    )
+    if drop_stale_bm25:
+        client.delete_vectors(
+            collection_name=collection, points=[memory_id], vector=["bm25"],
+        )
+    if "text_lemmatized" in payload:
+        # The lemmatized shadow of the OLD text would otherwise feed the
+        # next BM25 re-encode (the store prefers it over ``data``).
+        client.delete_payload(
+            collection_name=collection, keys=["text_lemmatized"], points=[memory_id],
+        )
+    client.set_payload(collection_name=collection, payload=top_level, points=[memory_id])
 
 
 def _tombstone(
@@ -711,6 +818,26 @@ def _times_derived_of(meta: dict | None) -> int:
         return max(1, int((meta or {}).get("times_derived") or 1))
     except (TypeError, ValueError):
         return 1
+
+
+def _tombstoned_ids(service, memory_ids: list[str]) -> set[str]:
+    """Ids among ``memory_ids`` whose live row is currently tombstoned (either metadata level)."""
+    from config import settings as core_settings
+
+    client = service._memory.vector_store.client
+    points = client.retrieve(
+        collection_name=core_settings.qdrant_collection,
+        ids=list(memory_ids),
+        with_payload=True,
+        with_vectors=False,
+    )
+    hidden: set[str] = set()
+    for pt in points or []:
+        meta = (getattr(pt, "payload", None) or {}).get("metadata") or {}
+        inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+        if meta.get("dream_tombstoned") or inner.get("dream_tombstoned"):
+            hidden.add(str(getattr(pt, "id", "")))
+    return hidden
 
 
 def _sum_times_derived(service, memory_ids: list[str]) -> int:

@@ -34,8 +34,9 @@ class FakeQdrant:
     """Just enough of QdrantClient: scroll / retrieve / set_payload / query_points.
 
     Filters are evaluated from the real ``qdrant_client.models.Filter`` the
-    production code builds (must / must_not over FieldCondition with
-    MatchValue / MatchAny on dotted payload keys).
+    production code builds: must / should / must_not, nested ``Filter``
+    conditions, ``IsEmptyCondition`` and FieldCondition with MatchValue /
+    MatchAny / MatchExcept on dotted payload keys.
     """
 
     def __init__(self):
@@ -66,18 +67,42 @@ class FakeQdrant:
         return cur
 
     def _cond(self, payload, cond):
+        """Evaluate one condition the way Qdrant does.
+
+        Supports a nested ``Filter`` (recursive must / should / must_not),
+        ``IsEmptyCondition`` (key absent, null or ``[]``) and
+        ``FieldCondition`` with ``MatchValue`` / ``MatchAny`` /
+        ``MatchExcept``. Anything else fails loudly so a new filter shape
+        cannot silently pass in this fake.
+        """
+        from qdrant_client.models import Filter, IsEmptyCondition
+
+        if isinstance(cond, Filter):
+            return self._passes(payload, cond)
+        if isinstance(cond, IsEmptyCondition):
+            val = self._value(payload, cond.is_empty.key)
+            return val is None or val == []
         val = self._value(payload, cond.key)
         m = cond.match
-        if hasattr(m, "any"):
+        if m is None:
+            raise NotImplementedError(f"fake Qdrant: unsupported condition {cond!r}")
+        if getattr(m, "any", None) is not None:
             return val in m.any
-        return val == m.value
+        if getattr(m, "except_", None) is not None:
+            # Qdrant: MatchExcept is false when the key is absent.
+            return val is not None and val not in m.except_
+        if hasattr(m, "value"):
+            return val == m.value
+        raise NotImplementedError(f"fake Qdrant: unsupported match {m!r}")
 
     def _passes(self, payload, flt):
         if flt is None:
             return True
-        return all(self._cond(payload, c) for c in (flt.must or [])) and not any(
-            self._cond(payload, c) for c in (flt.must_not or [])
-        )
+        if not all(self._cond(payload, c) for c in (flt.must or [])):
+            return False
+        if flt.should and not any(self._cond(payload, c) for c in flt.should):
+            return False
+        return not any(self._cond(payload, c) for c in (flt.must_not or []))
 
     def _pt(self, pid):
         p = self.points[pid]
@@ -112,6 +137,9 @@ class FakeGraph:
 
     def __init__(self):
         self.edges: dict[str, dict] = {}
+        # Episodic node uuid -> ``entity_edges`` (what Graphiti stores for an episode:
+        # the uuids of the edges it resolved and the edges it invalidated)
+        self.episodes: dict[str, list[str]] = {}
         self.calls: list[str] = []
         self.driver = self
 
@@ -121,16 +149,29 @@ class FakeGraph:
             "invalid_at": None, "expired_at": None,
         }
 
-    def invalidate(self, *uuids):
+    def invalidate(self, *uuids, by=None):
+        """Invalidate edges; ``by`` is the episode that did it (Graphiti lists
+        the invalidated edges in that episode's ``entity_edges``)."""
         now = datetime.now(timezone.utc)
         for u in uuids:
             self.edges[u]["invalid_at"] = now
             self.edges[u]["expired_at"] = now
+            if by is not None:
+                self.episodes.setdefault(by, []).append(u)
 
     def delete_cascade(self, *uuids):
         """Episode-delete cascade: expired_at only, invalid_at untouched."""
         for u in uuids:
             self.edges[u]["expired_at"] = datetime.now(timezone.utc)
+
+    @staticmethod
+    def _episode_clause(cypher, episodes, new_ep):
+        """Evaluate whichever episode predicate the Cypher text actually uses,
+        so the fake can't drift from the production statement."""
+        if "NOT $new_episode_uuid IN" in cypher:
+            return new_ep not in episodes
+        assert "ep <> $new_episode_uuid" in cypher, "unrecognised episode predicate"
+        return any(ep != new_ep for ep in episodes)
 
     # driver surface
     def session(self):
@@ -145,7 +186,17 @@ class FakeGraph:
 
             async def run(self_inner, cypher, **params):
                 graph.calls.append(cypher)
-                if "count(r) AS total" in cypher:
+                if "collect(r.fact) AS facts" in cypher:
+                    by_ep: dict[str, list[str]] = {}
+                    for e in graph.edges.values():
+                        if e["group_id"] != params["group_id"]:
+                            continue
+                        if e["invalid_at"] is None and e["expired_at"] is None:
+                            for ep in e["episodes"]:
+                                if ep in params["episode_uuids"]:
+                                    by_ep.setdefault(ep, []).append(e["fact"])
+                    rows = [{"episode_uuid": k, "facts": v} for k, v in by_ep.items()]
+                elif "count(r) AS total" in cypher:
                     eps = [
                         e for e in graph.edges.values()
                         if e["group_id"] == params["group_id"]
@@ -157,13 +208,21 @@ class FakeGraph:
                     rows = [{"total": len(eps), "live": live}]
                 elif "invalid_at IS NOT NULL" in cypher:
                     since = datetime.fromisoformat(params["since"])
+                    # the probe keeps only edges listed in the probing episode's own
+                    # ``entity_edges``; evaluated from the query text, so a query
+                    # without that clause lets every edge in the window through
+                    attributed = None
+                    if "r.uuid IN coalesce(new_ep.entity_edges, [])" in cypher:
+                        assert "(new_ep:Episodic {uuid: $new_episode_uuid" in cypher
+                        attributed = set(graph.episodes.get(params["new_episode_uuid"], []))
                     rows = [
                         {"uuid": e["uuid"], "fact": e["fact"], "episodes": e["episodes"]}
                         for e in graph.edges.values()
                         if e["group_id"] == params["group_id"]
                         and e["invalid_at"] is not None
                         and e["expired_at"] >= since
-                        and params["new_episode_uuid"] not in e["episodes"]
+                        and graph._episode_clause(cypher, e["episodes"], params["new_episode_uuid"])
+                        and (attributed is None or e["uuid"] in attributed)
                     ]
                 else:
                     counts: dict[str, int] = {}
@@ -210,7 +269,7 @@ def _graph_add(graph, *, episode_uuid, invalidate=()):
     """graph.add stand-in: invalidates edges (as Graphiti would mid-write)."""
 
     def _add(**kwargs):
-        graph.invalidate(*invalidate)
+        graph.invalidate(*invalidate, by=episode_uuid)
         return {"episode_uuid": episode_uuid, "episode_name": f"name-{episode_uuid}"}
 
     return _add
@@ -264,12 +323,184 @@ class TestSingleRowEpisode:
         qdrant.add("new", user="u1", data="x")
         graph.add_edge("E1", "User lives in Berlin", ["ep-old"])
         graph.add_edge("E2", "User works at Acme", ["ep-old"])  # still live
+        # distinct, realistic: both edges ~0.88-0.90 to the row (inside the margin)
+        svc._embed_map["User lives in Berlin"] = [0.90, 0.436, 0.0]
+        svc._embed_map["User works at Acme"] = [0.88, 0.0, 0.475]
         svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
 
         _enrich(svc)
 
         assert not qdrant.meta("old").get("dream_tombstoned")
         assert "superseded_reason" not in qdrant.meta("old")
+
+    def test_old_edge_that_gained_the_new_episode_as_a_duplicate_is_superseded(self, env):
+        """Real-store shape (VPS gate failure): the new episode's extracted edge
+        dedups onto the old edge, Graphiti APPENDS the new episode to it and
+        then invalidates it, so the old edge cites [old, new]."""
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="User lives in Paris",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
+        qdrant.add("new", user="u1", data="User moved to London and no longer lives in Paris")
+        graph.add_edge("E1", "User lives in Paris", ["ep-old"])
+
+        def _add(**kw):
+            graph.edges["E1"]["episodes"].append("ep-new")  # dedup appends the new episode
+            graph.invalidate("E1", by="ep-new")
+            return {"episode_uuid": "ep-new", "episode_name": "n"}
+
+        svc._memory.graph.add.side_effect = _add
+        _enrich(svc)
+
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+        assert qdrant.meta("old")["superseded_edge_uuids"] == ["E1"]
+        assert not qdrant.meta("new").get("dream_tombstoned")
+
+    def test_edge_born_expired_by_the_new_episode_alone_is_not_a_contradiction(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="d",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"})
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "live old fact", ["ep-old"])
+        graph.add_edge("E2", "born expired", ["ep-new"])
+
+        def _add(**kw):
+            graph.invalidate("E2", by="ep-new")
+            return {"episode_uuid": "ep-new", "episode_name": "n"}
+
+        svc._memory.graph.add.side_effect = _add
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_one_fact_two_edges_dead_main_claim_supersedes_row(self, env):
+        """Real-store shape (gate): "Alice lives in Paris, France." yields TWO
+        edges from one episode; Graphiti invalidates the residence edge only.
+        The incidental "Paris is a city in France" edge stays live, and the
+        row must still be superseded because the dead edge is its main claim."""
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris, France.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=[1.0, 0.0, 0.0])
+        qdrant.add("new", user="u1", data="Alice moved to London and no longer lives in Paris.")
+        graph.add_edge("E1", "Alice resides in the city of Paris.", ["ep-old"])
+        graph.add_edge("E2", "Paris is a city situated in France.", ["ep-old"])  # stays live
+        svc._embed_map["Alice resides in the city of Paris."] = [0.95, 0.05, 0.0]
+        svc._embed_map["Paris is a city situated in France."] = [0.2, 0.0, 0.98]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+        assert qdrant.meta("old")["superseded_edge_uuids"] == ["E1"]
+        decide = [t for t in svc._supersession_diag["new"]["trace"] if t["stage"] == "decide"]
+        assert decide and decide[0]["mode"] == "single_fact_partial" and decide[0]["supersede"] is True
+
+    def _partial_setup(self, env, dead_vec, live_vec, row_vec=(1.0, 0.0, 0.0)):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris and works at Acme.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=list(row_vec))
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "Alice works at Acme.", ["ep-old"])  # dead
+        graph.add_edge("E2", "Alice resides in Paris.", ["ep-old"])  # live
+        svc._embed_map["Alice works at Acme."] = list(dead_vec)
+        svc._embed_map["Alice resides in Paris."] = list(live_vec)
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+        return svc, qdrant
+
+    def test_compound_row_with_realistic_close_cosines_is_left_alone(self, env):
+        """Both edges ~0.85-0.9 to the row, inside the margin: embedding noise."""
+        svc, qdrant = self._partial_setup(env, [0.88, 0.47, 0.0], [0.86, 0.0, 0.51])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_both_edges_near_085_with_modest_margin_is_left_alone(self, env):
+        # dead 0.86 vs live 0.84: at the floor but margin 0.02 < 0.05
+        svc, qdrant = self._partial_setup(env, [0.86, 0.51, 0.0], [0.84, 0.0, 0.54])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_dead_edge_clearly_above_floor_and_margin_supersedes(self, env):
+        # dead 0.92 vs live 0.80 (realistic): above floor 0.85, margin 0.12
+        svc, qdrant = self._partial_setup(env, [0.92, 0.392, 0.0], [0.8, 0.0, 0.6])
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_dead_edge_below_the_floor_is_not_enough_even_with_margin(self, env):
+        """Beats the live edge by far but only cos 0.5 to the row: not its claim."""
+        svc, qdrant = self._partial_setup(env, [0.5, 0.87, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_partial_floor_default_is_pinned_at_085(self):
+        from config import Settings
+
+        assert Settings.model_fields["graph_supersession_partial_min_similarity"].default == 0.85
+
+    def test_dead_edge_at_084_with_a_big_margin_is_left_alone(self, env):
+        svc, qdrant = self._partial_setup(env, [0.84, 0.5426, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_dead_edge_at_086_with_the_margin_supersedes(self, env):
+        svc, qdrant = self._partial_setup(env, [0.86, 0.5103, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_embedder_failure_leaves_the_row(self, env):
+        svc, qdrant = self._partial_setup(env, [1.0, 0.0, 0.0], [0.0, 0.0, 1.0])
+        svc._memory.embedding_model.embed.side_effect = RuntimeError("embed down")
+        assert _enrich(svc) is True
+        assert not qdrant.meta("old").get("dream_tombstoned")
+
+    def test_vector_length_mismatch_leaves_the_row(self, env):
+        svc, qdrant = self._partial_setup(env, [1.0, 0.0], [0.0, 0.0, 1.0])
+        _enrich(svc)
+        assert not qdrant.meta("old").get("dream_tombstoned")
+        ev = [t for t in svc._supersession_diag["new"]["trace"] if t["stage"] == "decide"][0]
+        assert "mismatch" in ev["error"]
+
+    def test_missing_stored_vector_falls_back_to_embedding_the_row_text(self, env):
+        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        svc._embed_map["Alice lives in Paris and works at Acme."] = [1.0, 0.0, 0.0]
+        svc._fetch_dense_vectors = MagicMock(return_value={})
+        _enrich(svc)
+        assert qdrant.meta("old")["dream_tombstoned"] is True
+
+    def test_embeddings_are_cached_per_call(self, env):
+        svc, qdrant = self._partial_setup(env, [0.95, 0.31, 0.0], [0.5, 0.0, 0.87])
+        svc._graphiti.driver.add_edge("E3", "Alice works at Acme.", ["ep-old"])  # same dead fact text
+        svc._memory.graph.add.side_effect = _graph_add(
+            svc._graphiti.driver, episode_uuid="ep-new", invalidate=["E1", "E3"])
+        _enrich(svc)
+        texts = [c.args[0] for c in svc._memory.embedding_model.embed.call_args_list]
+        # two dead edges x one row: each distinct fact embedded exactly once
+        assert sorted(texts) == ["Alice resides in Paris.", "Alice works at Acme."], texts
+
+    def test_diagnostics_are_per_call_not_a_shared_singleton(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("new", user="u1", data="x")
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-a")
+        _enrich(svc, memory_id="new")
+        qdrant.add("new2", user="u1", data="y")
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-b")
+        _enrich(svc, memory_id="new2")
+        assert set(svc._supersession_diag) == {"new", "new2"}
+
+    def test_dead_edge_that_is_not_the_rows_main_claim_leaves_the_row(self, env):
+        svc, qdrant, graph = env
+        qdrant.add("old", user="u1", data="Alice lives in Paris, France.",
+                   metadata={"graph_episode_uuid": "ep-old", "graph_episode_kind": "fact"},
+                   vector=[1.0, 0.0, 0.0])
+        qdrant.add("new", user="u1", data="x")
+        graph.add_edge("E1", "Alice once visited Rome.", ["ep-old"])  # dead, unrelated to the row
+        graph.add_edge("E2", "Alice resides in the city of Paris.", ["ep-old"])  # live, main claim
+        svc._embed_map["Alice once visited Rome."] = [0.0, 0.0, 1.0]
+        svc._embed_map["Alice resides in the city of Paris."] = [0.97, 0.0, 0.1]
+        svc._memory.graph.add.side_effect = _graph_add(graph, episode_uuid="ep-new", invalidate=["E1"])
+
+        _enrich(svc)
+
+        assert not qdrant.meta("old").get("dream_tombstoned")
 
     def test_delete_cascade_expiry_is_not_a_contradiction(self, env):
         """A cascade only sets expired_at (no invalid_at) — must not supersede."""
@@ -922,7 +1153,7 @@ class TestStaleGraphCheckOnDedupHit:
         survivor = MemoryResponse(id="old", memory="x", scope="global", visibility="private")
         service = MagicMock()
 
-        def _batch(items, dedup_ids=None):
+        def _batch(items, dedup_ids=None, graph_jobs=None):
             dedup_ids.add("old")
             return [survivor]
 
@@ -967,3 +1198,60 @@ class TestStaleCheckEnqueueIsFlagged:
         monkeypatch.setattr(settings, "graph_supersession_enabled", True)
         await worker._enqueue_stale_graph_check({"redis": redis}, mem, "x", "u1", None)
         redis.enqueue_job.assert_awaited_once()
+
+
+# ──────────────────────────────────────────────
+# The fake's filter semantics match qdrant-client's own in-process engine
+# ──────────────────────────────────────────────
+
+
+def test_fake_filter_matches_qdrant_local_engine_on_nested_workspace_filter():
+    """Nested Filter / IsEmpty / MatchExcept: the fake must agree with Qdrant.
+
+    The shape mirrors a workspace pushdown (``workspace`` absent, empty,
+    "memory" or one of the reference workspaces) combined with the
+    tombstone must_not the read paths add.
+    """
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import (
+        Distance, FieldCondition, Filter, IsEmptyCondition, MatchAny,
+        MatchExcept, MatchValue, PayloadField, PointStruct, VectorParams,
+    )
+
+    rows = {
+        1: {"user_id": "u", "metadata": {"category": "preference"}},
+        2: {"user_id": "u", "metadata": {"workspace": None, "category": "preference"}},
+        3: {"user_id": "u", "metadata": {"workspace": "", "category": "preference"}},
+        4: {"user_id": "u", "metadata": {"workspace": "memory", "category": "preference"}},
+        5: {"user_id": "u", "metadata": {"workspace": "ref-a", "category": "preference"}},
+        6: {"user_id": "u", "metadata": {"workspace": "ref-b", "category": "preference"}},
+        7: {"user_id": "u", "metadata": {"workspace": "memory", "category": "preference", "dream_tombstoned": True}},
+        8: {"user_id": "v", "metadata": {"workspace": "memory", "category": "preference"}},
+        10: {"user_id": "u", "metadata": {"workspace": "memory"}},  # no category: MatchExcept is false
+        9: {"user_id": "u", "metadata": {"workspace": "memory", "category": "secret"}},
+    }
+    flt = Filter(
+        must=[
+            FieldCondition(key="user_id", match=MatchValue(value="u")),
+            Filter(should=[
+                IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")),
+                FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")),
+                FieldCondition(key="metadata.workspace", match=MatchValue(value="")),
+                FieldCondition(key="metadata.workspace", match=MatchAny(any=["ref-a"])),
+            ]),
+            FieldCondition(key="metadata.category", match=MatchExcept(**{"except": ["secret"]})),
+        ],
+        must_not=[FieldCondition(key="metadata.dream_tombstoned", match=MatchValue(value=True))],
+    )
+
+    real = QdrantClient(":memory:")
+    real.create_collection("c", vectors_config=VectorParams(size=3, distance=Distance.COSINE))
+    real.upsert("c", points=[PointStruct(id=i, vector=[1.0, 0.0, 0.0], payload=p) for i, p in rows.items()])
+    real_ids = sorted(p.id for p in real.scroll("c", scroll_filter=flt, limit=100)[0])
+
+    fake = FakeQdrant()
+    fake_ids = sorted(i for i, p in rows.items() if fake._passes(p, flt))
+
+    assert fake_ids == real_ids
+    # Sanity: the expected rows, so a vacuous agreement (both empty) fails.
+    assert real_ids == [1, 2, 3, 4, 5]

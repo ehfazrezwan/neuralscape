@@ -45,18 +45,18 @@ def test_resolve_bound_prefers_real_registered_system():
     real = SimpleNamespace(
         info=KnowledgeSystemInfo(name="code-x", kind="code",
                                  capabilities=frozenset({"query"}), transport="in-process"),
-        _engine=SimpleNamespace(code_space="code--o--r"),
+        _engine=SimpleNamespace(code_space="code--u1--r"),
     )
     registry.KNOWLEDGE_REGISTRY["code-x"] = real
     try:
-        got = resolve_bound_code_system("code-x", "code--o--r", "u1", SimpleNamespace())
+        got = resolve_bound_code_system("code-x", "code--u1--r", "u1", SimpleNamespace())
         assert got is real  # short-circuit, no rebuild
     finally:
         registry.KNOWLEDGE_REGISTRY.pop("code-x", None)
 
 
 def test_resolve_bound_does_not_bind_wrong_code_space():
-    """MF3 moat guard: a registered real system for code--o--r must NOT satisfy a
+    """MF3 moat guard: a registered real system for code--u1--r must NOT satisfy a
     request for a DIFFERENT code_space — it rebinds instead of returning the wrong
     engine."""
     from knowledge import registry
@@ -65,14 +65,14 @@ def test_resolve_bound_does_not_bind_wrong_code_space():
     real = SimpleNamespace(
         info=KnowledgeSystemInfo(name="code-x", kind="code",
                                  capabilities=frozenset({"query"}), transport="in-process"),
-        _engine=SimpleNamespace(code_space="code--o--r"),
+        _engine=SimpleNamespace(code_space="code--u1--r"),
     )
     registry.KNOWLEDGE_REGISTRY["code-x"] = real
     try:
         with patch("knowledge.code_dispatch.resolve_code_engine", return_value=None) as m:
             # Request a DIFFERENT space → must NOT return `real`; falls to rebind
             # (which we stub to None), so the result is None, never the wrong engine.
-            got = resolve_bound_code_system("code-x", "code--o--OTHER", "u1", SimpleNamespace())
+            got = resolve_bound_code_system("code-x", "code--u1--OTHER", "u1", SimpleNamespace())
         assert got is None
         m.assert_called_once()  # it attempted a rebind rather than returning `real`
     finally:
@@ -93,10 +93,10 @@ def test_resolve_bound_rebinds_placeholder(tmp_path):
     )
     registry.KNOWLEDGE_REGISTRY["code-graphify-lib"] = placeholder
     settings, _ = _settings_with_repo(tmp_path, "r")
-    fake_engine = SimpleNamespace(code_space="code--o--r", G=Mock())
+    fake_engine = SimpleNamespace(code_space="code--u1--r", G=Mock())
     try:
         with patch("knowledge.code_dispatch.resolve_code_engine", return_value=fake_engine) as m:
-            got = resolve_bound_code_system("code-graphify-lib", "code--o--r", "u1", settings)
+            got = resolve_bound_code_system("code-graphify-lib", "code--u1--r", "u1", settings)
         assert got is not placeholder
         assert got._engine is fake_engine
         # transport carried verbatim from the placeholder (declared, not branched)
@@ -110,13 +110,13 @@ def test_resolve_bound_returns_none_when_unbindable(tmp_path):
     from knowledge.code_dispatch import resolve_bound_code_system
 
     with patch("knowledge.code_dispatch.resolve_code_engine", return_value=None):
-        assert resolve_bound_code_system("code-cbm", "code--o--r", "u1", SimpleNamespace()) is None
+        assert resolve_bound_code_system("code-cbm", "code--u1--r", "u1", SimpleNamespace()) is None
 
 
 def test_resolve_code_engine_unknown_system():
     from knowledge.code_dispatch import resolve_code_engine
 
-    assert resolve_code_engine("nope", "code--o--r", "u1", SimpleNamespace()) is None
+    assert resolve_code_engine("nope", "code--u1--r", "u1", SimpleNamespace()) is None
 
 
 # ── index_store ──────────────────────────────────────────────────────
@@ -127,15 +127,17 @@ def test_index_store_roundtrip_in_memory():
 
     index_store._reset_for_tests()
     # Force in-memory (no redis) by stubbing the client resolver.
-    with patch("knowledge.index_store._redis", return_value=None):
-        index_store.record_index("code--o--r", {"system": "code-cbm", "symbols": 5})
-        assert index_store.get_index("code--o--r")["symbols"] == 5
+    with patch("knowledge.index_store._redis", return_value=None), patch(
+        "knowledge.index_store._redis_read", return_value=None
+    ):
+        index_store.record_index("code--u1--r", {"system": "code-cbm", "symbols": 5})
+        assert index_store.get_index("code--u1--r")["symbols"] == 5
         assert index_store.get_index("missing") is None
 
-        index_store.save_project_config("p1", {"code_systems": ["code-cbm"], "code_space": "code--o--r"})
+        index_store.save_project_config("p1", {"code_systems": ["code-cbm"], "code_space": "code--u1--r"})
         cfg = index_store.load_project_config("p1")
         assert cfg["code_systems"] == ["code-cbm"]
-        assert cfg["code_space"] == "code--o--r"
+        assert cfg["code_space"] == "code--u1--r"
         assert index_store.load_project_config("p2") is None
     index_store._reset_for_tests()
 
@@ -152,7 +154,9 @@ def test_router_config_persists_code_space():
 
     index_store._reset_for_tests()
     _PROJECT_CONFIGS.pop("pg", None)
-    with patch("knowledge.index_store._redis", return_value=None):
+    with patch("knowledge.index_store._redis", return_value=None), patch(
+        "knowledge.index_store._redis_read", return_value=None
+    ):
         set_project_config(ProjectKnowledgeConfig(
             project_id="pg", code_systems=["code-cbm"], default_engine="code-cbm",
             code_space="code--o--pg",

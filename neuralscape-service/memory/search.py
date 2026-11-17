@@ -4,21 +4,32 @@ Mechanically extracted from memory_service.py (mixins-with-facade split);
 code is verbatim — behavior unchanged.
 """
 
+import contextvars
 import logging
+import time
+import uuid
 
 from config import settings
-from schemas import MemoryResponse, MemoryVisibility
-from memory.groups import _edge_is_invalidated, _get_group_ids, _live_edges_filter
+from schemas import MemoryResponse, MemoryVisibility, RecallResults
+from usage_capture import attributed
+from memory.groups import (
+    _build_group_id,
+    _edge_is_invalidated,
+    _get_group_ids,
+    _live_edges_filter,
+    _scoped_groups,
+)
 from memory.ranking import (
     RRF_K,
     _dense_score_floor,
+    _fit_vector_to_collection,
     _fused_order_keys,
+    _graph_edge_cosine,
     _record_order_key,
     _reinforcement_boost,
     _resolve_order_keys,
     _rrf_fuse,
     _salience_tiebreak,
-    _unit_cosine,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +59,7 @@ def _dt_to_iso(value):
 # blocked on the Graphiti bridge future, so a modest pool bounds concurrent
 # graph fan-out without ever serializing a single search.
 from concurrent.futures import ThreadPoolExecutor as _ThreadPoolExecutor
+from concurrent.futures import TimeoutError as _FuturesTimeoutError
 
 _GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
     max_workers=16, thread_name_prefix="graph-search"
@@ -57,11 +69,101 @@ _GRAPH_SEARCH_POOL = _ThreadPoolExecutor(
 # can never hang a read indefinitely.
 _GRAPH_SEARCH_JOIN_TIMEOUT_S = 45.0
 
+# Count of graph legs abandoned by the GRAPH_LEG_BUDGET_ENABLED budget (no
+# metrics backend in this service; the structured warning is the primary
+# signal, this counter is for tests and ad-hoc inspection).
+import threading as _threading
+
+_graph_leg_budget_timeouts = 0
+
+_graph_leg_budget_lock = _threading.Lock()
+
+
+def _episode_uuid_list(value) -> list[str]:
+    """Supporting-episode uuids of a Graphiti edge as a plain list of strings."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [u for u in value if isinstance(u, str) and u]
+
+
+def _degraded_graph_result() -> dict:
+    """Empty graph-search result marked as an outage, not as "no facts"."""
+    return {
+        "edges": [],
+        "nodes": [],
+        "episodes": [],
+        "communities": [],
+        "degraded": True,
+        "error": "graph_unavailable",
+    }
+
+
+def _note_graph_leg_budget_timeout() -> int:
+    global _graph_leg_budget_timeouts
+    with _graph_leg_budget_lock:
+        _graph_leg_budget_timeouts += 1
+        return _graph_leg_budget_timeouts
+
 # R3: per-snippet char cap for recall-side episode excerpts. Bounds evidence
 # tokens; the COUNT of episode rows is separately capped at 3 (the ask sweet
 # spot). A plain char cap (not ask.py's sentence-boundary _clip_content) keeps
 # the search mixin free of an ask.py import (which would be circular).
 _EPISODE_SNIPPET_CLIP = 600
+
+def _effective_workspaces(workspaces: list[str] | None) -> list[str]:
+    """Workspaces a recall may read. Absent or empty means ``["memory"]``."""
+    return list(workspaces) if workspaces else ["memory"]
+
+
+def _workspace_filter(effective: list[str]):
+    """Qdrant condition limiting rows to the requested workspaces.
+
+    ``"memory"`` matches rows whose ``metadata.workspace`` is absent, null or
+    ``"memory"`` (legacy rows carry no workspace); every other name matches
+    exactly. Part of the Qdrant query filter, so the dense and BM25 legs both
+    apply it before ``limit`` cuts the pool.
+    """
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        IsEmptyCondition,
+        MatchAny,
+        MatchValue,
+        PayloadField,
+    )
+
+    refs = [w for w in effective if w != "memory"]
+    should: list = []
+    if "memory" in effective:
+        should.append(IsEmptyCondition(is_empty=PayloadField(key="metadata.workspace")))
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="memory")))
+        # Legacy/odd rows with an empty-string workspace were memory rows.
+        should.append(FieldCondition(key="metadata.workspace", match=MatchValue(value="")))
+    if refs:
+        should.append(FieldCondition(key="metadata.workspace", match=MatchAny(any=refs)))
+    return Filter(should=should)
+
+
+
+def _plain_recall_request(
+    *, categories, scope, domain, observation_type, concepts, memory_kind, workspaces, visibility
+) -> bool:
+    """Whether a search carries nothing the routed engine cannot apply.
+
+    The engine filters by owner, shared pool and project only.  A request that narrows by category,
+    scope, domain, observation type, concepts, memory kind or workspaces, selects the standard tier
+    (or would include it: ``STANDARDS_ENABLED`` adds the standard pool to every unnarrowed search) is
+    served by the normal path, which applies all of them.
+    """
+
+    if categories or scope or domain or observation_type or concepts or memory_kind or workspaces:
+        return False
+    if visibility == MemoryVisibility.STANDARD.value:
+        return False
+    if settings.standards_enabled and visibility is None:
+        return False
+    return True
+
 
 class SearchMixin:
     """SearchMixin for MemoryService (mechanical split — see memory_service.py)."""
@@ -139,17 +241,11 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
-        # Workspace filter (WT6): default to memory type only (reference fenced out).
-        # Explicit workspaces list opens the door to reference content. For now,
-        # simple implementation: filter post-retrieval if needed. A future optimization
-        # can use Qdrant's should/must filter combinations.
-        # When workspaces=None or ["memory"], exclude any rows with non-memory workspace.
-        effective_workspaces = workspaces if workspaces is not None else ["memory"]
-        if effective_workspaces == ["memory"]:
-            # Memory-only: exclude rows with a non-None, non-"memory" workspace.
-            # This is done post-retrieval for simplicity (Qdrant's filter syntax
-            # doesn't cleanly express "IsEmpty OR IsNull OR MatchValue('memory')").
-            pass  # Applied as post-filter below
+        # Workspace filter (WT6): in the Qdrant filter, so the pool is cut to the
+        # requested workspaces before ``limit``. The per-hit check below stays
+        # as defence in depth.
+        effective_workspaces = _effective_workspaces(workspaces)
+        must.append(_workspace_filter(effective_workspaces))
 
         # qdrant-client v1.13+ removed `.search()` in favor of `.query_points()`;
         # the response wraps hits in a `.points` attribute.
@@ -337,6 +433,10 @@ class SearchMixin:
         if concepts:
             must.append(FieldCondition(key="metadata.concepts", match=MatchAny(any=concepts)))
 
+        # Workspace filter (WT6): same Qdrant-side filter as the shared pool.
+        effective_workspaces = _effective_workspaces(workspaces)
+        must.append(_workspace_filter(effective_workspaces))
+
         qfilter = Filter(must=must, must_not=must_not)
         result = client.query_points(
             collection_name=settings.qdrant_collection,
@@ -352,9 +452,6 @@ class SearchMixin:
         lexical_hits = self._lexical_pool_hits(m, query, qfilter, limit)
         fused = _rrf_fuse(dense_hits, lexical_hits, limit)
         dense_floor = _dense_score_floor(dense_hits)
-
-        # Workspace filter (WT6): same post-retrieval filter as shared pool
-        effective_workspaces = workspaces if workspaces is not None else ["memory"]
 
         out: list[MemoryResponse] = []
         pool_keys = _fused_order_keys(fused, dense_hits)
@@ -394,6 +491,73 @@ class SearchMixin:
     # Search operations
     # ──────────────────────────────────────────────
 
+    def _engine_recall(
+        self, switch, query: str, user_id: str, project_id, limit: int, visibility, include_shared: bool
+    ):
+        """Vector recall from the serving engine, hydrated and re-checked against the memory rows.
+
+        Only a *subset* of what the normal path may return is ever returned: every engine hit is
+        re-read from the memory store and kept only if the caller may read it, it is not a
+        consolidation tombstone, it lives in the default ``memory`` workspace (the reference-workspace
+        fence) and, when the request names a project, it belongs to that project or is global.  The graph and
+        lexical legs and the rerank are not part of a routed search.
+
+        Returns ``None`` (the caller falls back to the normal path) when the engine itself fails.
+        """
+
+        try:
+            hits = switch.recall(
+                user_id, query, limit, project_id=project_id,
+                include_shared=include_shared, visibility=visibility, include_global=True,
+            )
+            if not hits:
+                return []
+            m = self._get_memory()
+            ids = []
+            for hit in hits:
+                try:
+                    uuid.UUID(str(hit.record_id))
+                except (ValueError, AttributeError, TypeError):
+                    continue  # the row store would refuse a malformed id for the whole batch
+                ids.append(str(hit.record_id))
+            by_id = {}
+            # The row store is asked in bounded batches.
+            for start in range(0, len(ids), 50):
+                points = m.vector_store.client.retrieve(
+                    collection_name=settings.qdrant_collection,
+                    ids=ids[start:start + 50],
+                    with_payload=True,
+                    with_vectors=False,
+                ) or []
+                by_id.update({str(getattr(p, "id", "")): p for p in points})
+            results = []
+            for hit in hits:
+                point = by_id.get(str(hit.record_id))
+                if point is None:
+                    continue
+                payload = getattr(point, "payload", None) or {}
+                if not self._payload_readable_by(payload, user_id):
+                    continue
+                meta = payload.get("metadata") or {}
+                inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+                if meta.get("dream_tombstoned") or inner.get("dream_tombstoned"):
+                    continue
+                if (meta.get("workspace") or inner.get("workspace") or "memory") != "memory":
+                    continue
+                if project_id and (meta.get("project_id") or inner.get("project_id")) != project_id and (
+                    # A project recall serves the project's rows and the caller's global ones.
+                    (meta.get("scope") or inner.get("scope")) != "global"
+                ):
+                    continue
+                row = self._point_to_response(point)
+                row.score = hit.score
+                results.append(row)
+            return results[:limit]
+        except Exception as error:  # noqa: BLE001 - an engine fault must not take recall down
+            logger.warning("routed engine recall failed; using the normal search path: %s", error)
+            return None
+
+    @attributed("search")
     def search(
         self,
         query: str,
@@ -443,6 +607,28 @@ class SearchMixin:
             within each pool, rank-transferred onto the cosine scale across
             pools); displayed scores stay native.
         """
+        # Routed-engine recall: only when ENGINE_ROUTING_ENABLED and ENGINE_ROUTING_RECALL_ENABLED
+        # are both true, and only for a plain request (nothing the engine cannot apply).  The flags are
+        # read before anything engine-related is imported: with them off this is two attribute reads.
+        if (
+            not vector_only
+            and settings.engine_routing_enabled is True
+            and settings.engine_routing_recall_enabled is True
+            and _plain_recall_request(
+                categories=categories, scope=scope, domain=domain, observation_type=observation_type,
+                concepts=concepts, memory_kind=memory_kind, workspaces=workspaces, visibility=visibility,
+            )
+        ):
+            from engine_adapters_switch import recall_switch
+
+            switch = recall_switch(settings)
+            if switch is not None:
+                routed = self._engine_recall(
+                    switch, query, user_id, project_id, limit, visibility, include_shared
+                )
+                if routed is not None:
+                    return routed
+
         m = self._get_memory()
         # Lazily ensure keyword/bool payload indexes for the hot-path filters
         # (audit 27 #14) — one attempt per service instance, never fatal.
@@ -459,9 +645,16 @@ class SearchMixin:
         # overlaps the vector pool queries below (the legs are independent —
         # Graphiti embeds the query itself). Joined right before the weave.
         graph_future = None
+        # Why the graph leg did not contribute (None = it did, or it was off):
+        # surfaced on the returned list so REST and MCP can say so.
+        graph_leg_status: str | None = None
+        graph_submitted_at = time.monotonic()
         if not vector_only:
             try:
+                # A copy of the caller's context travels with the leg: the usage attempt (and the
+                # log context) it is bound to must be visible to Graphiti's own provider calls.
                 graph_future = _GRAPH_SEARCH_POOL.submit(
+                    contextvars.copy_context().run,
                     self._search_graph_for_visibility,
                     query=query,
                     user_id=user_id,
@@ -470,9 +663,11 @@ class SearchMixin:
                     visibility=visibility,
                     include_shared=include_shared,
                     include_episodes=settings.graph_episode_recall_enabled,
+                    workspaces=workspaces,
                 )
             except Exception as e:
                 logger.warning(f"Graph search submit failed (non-critical): {e}")
+                graph_leg_status = "skipped"
 
         vector_responses: list[MemoryResponse] = []
         # Per-row fused-order keys recorded by the pool helpers (see
@@ -681,16 +876,39 @@ class SearchMixin:
         episodes_for_later: list[MemoryResponse] = []
         if graph_future is not None:
             try:
-                graph_results = graph_future.result(
-                    timeout=_GRAPH_SEARCH_JOIN_TIMEOUT_S
+                if settings.graph_leg_budget_enabled:
+                    # Budget runs from SUBMIT, not from here: the vector pools
+                    # already consumed part of it while the leg ran.
+                    graph_wait_s = max(
+                        0.0,
+                        settings.graph_leg_budget_s
+                        - (time.monotonic() - graph_submitted_at),
+                    )
+                else:
+                    graph_wait_s = _GRAPH_SEARCH_JOIN_TIMEOUT_S
+                graph_results = graph_future.result(timeout=graph_wait_s)
+                if graph_results.get("degraded"):
+                    graph_leg_status = "failed"
+                # Reversible tombstones hide a memory's vector row only; its
+                # graph episode, and a fact supported solely by such episodes,
+                # must not come back through the graph legs.
+                hidden_eps = self._tombstoned_episode_uuids(
+                    [str(ep.get("uuid") or "") for ep in graph_results.get("episodes", [])]
+                    + [u for e in graph_results.get("edges", []) for u in (e.get("episodes") or [])]
                 )
                 for edge in graph_results.get("edges", []):
+                    sup = edge.get("episodes") or []
+                    if hidden_eps and sup and all(u in hidden_eps for u in sup):
+                        continue
                     # Graph as a ranked leg: score each edge with its STORED
                     # fact_embedding (piggybacked on the enrichment Cypher in
                     # _enrich_graph_results) against the query vector computed
                     # once above — local cosine in the same Gemini space as
-                    # the vector rows, clamped to [0, 1]. Edges without a
-                    # stored embedding stay unscored (rank last on merit).
+                    # the vector rows, clamped to [0, 1]. The graph store may
+                    # hold longer vectors than Qdrant (same MRL model, bigger
+                    # output_dimensionality): those compare on the common
+                    # prefix (_graph_edge_cosine). Edges without a stored
+                    # embedding stay unscored (rank last on merit).
                     emb = edge.get("fact_embedding") or None
                     graph_responses.append(
                         MemoryResponse(
@@ -698,7 +916,7 @@ class SearchMixin:
                             memory=edge.get("fact", edge.get("name", "")),
                             source="graph",
                             score=(
-                                _unit_cosine(query_embedding, emb)
+                                _graph_edge_cosine(query_embedding, emb)
                                 if emb is not None
                                 else None
                             ),
@@ -723,6 +941,8 @@ class SearchMixin:
                 if settings.graph_episode_recall_enabled:
                     for ep in graph_results.get("episodes", []):
                         ep_uuid = str(ep.get("uuid") or "")
+                        if ep_uuid in hidden_eps:
+                            continue
                         ep_content = str(ep.get("content") or "")
                         # Clip each recall episode snippet to a bounded length.
                         # (Not the same as ask.py's _clip_content, which clips at
@@ -739,8 +959,33 @@ class SearchMixin:
                                 created_at=ep.get("created_at") or None,
                             )
                         )
+            except _FuturesTimeoutError:
+                graph_leg_status = "timed_out"
+                if not settings.graph_leg_budget_enabled:
+                    # Flag off: identical to the pre-budget handling.
+                    logger.warning(
+                        "Graph search failed during recall (non-critical): "
+                        f"{_FuturesTimeoutError()}"
+                    )
+                else:
+                    # Do not cancel the bridge coroutine (it owns the bridge
+                    # loop); the pool thread finishes on its own. cancel() only
+                    # drops the future if it never started.
+                    graph_future.cancel()
+                    logger.warning(
+                        "graph_leg_budget_exceeded: returning vector-only results",
+                        extra={
+                            "event": "graph_leg_budget_exceeded",
+                            "budget_s": settings.graph_leg_budget_s,
+                            "elapsed_s": round(time.monotonic() - graph_submitted_at, 3),
+                            "vector_results": len(vector_responses),
+                            "timeouts_total": _note_graph_leg_budget_timeout(),
+                        },
+                    )
+                episodes_for_later = []
             except Exception as e:
                 logger.warning(f"Graph search failed during recall (non-critical): {e}")
+                graph_leg_status = "failed"
                 episodes_for_later = []
 
         # Enrich graph rows with metadata from their nearest source memory
@@ -826,7 +1071,7 @@ class SearchMixin:
             from hybrid_inference import rerank
 
             combined = rerank(query, combined)
-        results = combined[:limit]
+        results = self._truncate_keeping_episode_rows(combined, limit)
 
         # Dreaming: fire-and-forget recall trace (reinforcement signal for
         # the dream sweep's promotion/retention scoring). Runs on a daemon
@@ -849,7 +1094,7 @@ class SearchMixin:
             except Exception:
                 pass
 
-        return results
+        return RecallResults(results, graph_leg=graph_leg_status)
 
     # Minimum vector similarity for graph→source enrichment to be trusted.
     # Below this, the "source" is just the nearest unrelated memory and we
@@ -937,7 +1182,13 @@ class SearchMixin:
             if edge_embeddings:
                 for i, _ in enrichable:
                     if i < len(edge_embeddings) and edge_embeddings[i]:
-                        provided[i] = edge_embeddings[i]
+                        # The graph store may be wider than the Qdrant
+                        # collection: truncate (same MRL model) or drop to
+                        # the embed fallback — never send a wrong-length
+                        # query vector.
+                        fitted = _fit_vector_to_collection(edge_embeddings[i])
+                        if fitted:
+                            provided[i] = fitted
             missing = [(i, text) for i, text in enrichable if i not in provided]
             if missing and not allow_embed_fallback:
                 # Plain-search hot path: rows without a stored embedding
@@ -1132,6 +1383,7 @@ class SearchMixin:
         visibility: str | None,
         include_shared: bool,
         include_episodes: bool = False,
+        workspaces: list[str] | None = None,
     ) -> dict:
         """search_graph with multi-user visibility scoping.
 
@@ -1142,36 +1394,136 @@ class SearchMixin:
         unenriched row from the shared pool could slip into a
         private-only response.
         """
+        # Every name is built by ``_build_group_id``, exactly as writes build it, so a narrowed
+        # read set never names a pool another (user, project) tuple folds into.
         def _standard_groups() -> list[str]:
             if not settings.standards_enabled:
                 return []
-            return ["standard"] + ([f"standard--project--{project_id}"] if project_id else [])
+            return ["standard"] + ([_build_group_id("standard", "", project_id)] if project_id else [])
+
+        def _private_groups() -> list[str]:
+            groups = [_build_group_id("private", user_id)]
+            if project_id:
+                groups.append(_build_group_id("private", user_id, project_id))
+            return groups
 
         if visibility == MemoryVisibility.PRIVATE.value:
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
+            group_ids = _private_groups()
         elif visibility == MemoryVisibility.STANDARD.value:
             group_ids = _standard_groups()
         elif visibility == MemoryVisibility.SHARED.value:
             group_ids = ["shared"]
             if project_id:
-                group_ids.append(f"shared--project--{project_id}")
+                group_ids.append(_build_group_id("shared", "", project_id))
         elif not include_shared:
             # No explicit visibility, but caller opted out of shared pool.
             # Standards remain in-scope — they are binding and independent of
             # the shared opt-out.
-            group_ids = [f"user--{user_id}"]
-            if project_id:
-                group_ids.append(f"user--{user_id}--project--{project_id}")
-            group_ids += _standard_groups()
+            group_ids = _private_groups() + _standard_groups()
         else:
             # Default: full read-set (caller's private + shared + standard).
             group_ids = _get_group_ids(user_id, project_id)
 
+        # Workspace partition (WT6): reference workspaces live in groups named
+        # ``<base>--ws--<workspace>`` (see groups._build_group_id). Derive them
+        # only from the caller's own readable base groups, so a workspace name
+        # can never widen who may read. Default (None) is unchanged.
+        if workspaces:
+            refs = [w for w in workspaces if w != "memory"]
+            # Name each workspace group through the builder (the injective
+            # encoding covers the whole tuple, so a suffix cannot be appended
+            # to an encoded base). The caller's possible bases are mapped back
+            # to their placement by building them, not by parsing names.
+            placements: dict[str, tuple[str, str, str | None]] = {}
+            for pool, owner in (("private", user_id), ("shared", ""), ("standard", "")):
+                for pid in (None, project_id):
+                    placements.setdefault(_build_group_id(pool, owner, pid), (pool, owner, pid))
+            ws_groups = [
+                _build_group_id(*placements[g], workspace=w)
+                for g in group_ids
+                for w in refs
+            ]
+            group_ids = (group_ids if "memory" in workspaces else []) + ws_groups
+
         return self._do_graph_search(
             query=query, group_ids=group_ids, limit=limit, include_episodes=include_episodes
         )
+
+    def _tombstoned_episode_uuids(self, episode_uuids) -> set[str]:
+        """Episode uuids whose every source memory is a reversible tombstone.
+
+        A dedup/dream/supersession tombstone hides a memory's Qdrant row only
+        (nothing is deleted from the graph, so the tombstone stays
+        reversible). The graph episode written for that memory stays
+        searchable, so recall must drop it here or the hidden text keeps
+        coming back as a ``[verbatim session excerpt]`` row. The link is
+        ``metadata.graph_episode_uuid`` on the Qdrant rows (indexed keyword).
+
+        One batched lookup per recall: first the tombstoned rows among the
+        given episodes (empty in the common case: a single cheap filtered
+        scroll), and only when some exist, the live rows of those episodes. A
+        conversation episode is shared by several fact rows and is hidden only
+        when ALL of them are tombstoned. An episode with no Qdrant row at all
+        is never hidden (nothing says it was). Restoring the tombstone clears
+        the flag, so the episode is visible again on the next read. Any
+        failure returns an empty set (logged once at WARNING, no memory text):
+        a read is never broken by this check, and a tombstone is a reversible
+        system hide, not access control.
+
+        Matching reads the outer ``metadata`` keys only, like the recall pools'
+        own tombstone filters (a double-wrapped ``metadata.metadata`` row is not
+        matched). The lookup is keyed by episode uuid and not owner-filtered:
+        episodes already come from the requester's groups, so on an episode
+        shared by several members' rows the requester's view depends on all
+        of them (intended: hidden only when every source row is tombstoned).
+        """
+        uuids = sorted({u for u in (episode_uuids or []) if isinstance(u, str) and u})
+        if not uuids:
+            return set()
+        try:
+            from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
+            client = self._get_memory().vector_store.client
+
+            def _scan(must: list, must_not: list | None = None) -> set[str]:
+                found: set[str] = set()
+                offset = None
+                while True:
+                    points, offset = client.scroll(
+                        collection_name=settings.qdrant_collection,
+                        scroll_filter=Filter(must=must, must_not=must_not or None),
+                        limit=256,
+                        offset=offset,
+                        with_payload=["metadata.graph_episode_uuid"],
+                        with_vectors=False,
+                    )
+                    for pt in points or []:
+                        meta = (pt.payload or {}).get("metadata") or {}
+                        ep = meta.get("graph_episode_uuid")
+                        if isinstance(ep, str):
+                            found.add(ep)
+                    if offset is None:
+                        return found
+
+            def _ep(values: list[str]):
+                return FieldCondition(
+                    key="metadata.graph_episode_uuid", match=MatchAny(any=values)
+                )
+
+            tomb = FieldCondition(
+                key="metadata.dream_tombstoned", match=MatchValue(value=True)
+            )
+            candidates = _scan([_ep(uuids), tomb])
+            if not candidates:
+                return set()
+            live = _scan([_ep(sorted(candidates))], [tomb])
+            return candidates - live
+        except Exception as e:
+            logger.warning(
+                "tombstoned-episode lookup failed (non-critical): tombstoned rows "
+                f"may reappear in this read ({type(e).__name__})"
+            )
+            return set()
 
     def _do_graph_search(
         self,
@@ -1184,6 +1536,14 @@ class SearchMixin:
         """Internal: run a graph search across the given group_ids."""
         g = self._get_graphiti()
         if g is None:
+            if getattr(self, "_graph_init_error", None):
+                # Configured but failed to initialise: an outage, not "off".
+                return _degraded_graph_result()
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+
+        # No groups means no results, and no graph call.
+        group_ids = _scoped_groups(group_ids)
+        if not group_ids:
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
         from graphiti_core.search.search_config import (
@@ -1237,6 +1597,9 @@ class SearchMixin:
                     "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
                     "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
                     "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                    # Supporting episodes: recall hides a fact whose every
+                    # supporting episode belongs to a tombstoned memory.
+                    "episodes": _episode_uuid_list(getattr(e, "episodes", None)),
                 }
                 for e in results.edges
                 # Belt-and-suspenders: some drivers/recipes skip the Cypher
@@ -1260,7 +1623,7 @@ class SearchMixin:
                     "created_at": _dt_to_iso(getattr(ep, "created_at", None)),
                     "valid_at": _dt_to_iso(getattr(ep, "valid_at", None)),
                 }
-                for ep in results.episodes[:3]
+                for ep in results.episodes[:3]  # capped before the tombstone hide (the caller's lookup), so a hidden one takes a slot
             ]
             communities = [
                 {"uuid": c.uuid, "name": c.name} for c in results.communities
@@ -1277,7 +1640,8 @@ class SearchMixin:
             }
         except Exception as e:
             logger.error(f"Graph search failed: {e}")
-            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+            # Marked, so hybrid recall can tell an outage from "no facts".
+            return _degraded_graph_result()
 
     def _enrich_graph_results(
         self,
@@ -1352,6 +1716,7 @@ class SearchMixin:
                 if rec.get("fact_embedding"):
                     item["fact_embedding"] = rec["fact_embedding"]
 
+    @attributed("search_graph")
     def search_graph(
         self,
         query: str,
@@ -1370,10 +1735,17 @@ class SearchMixin:
             search_config: Optional SearchConfig dict override
 
         Returns:
-            Dict with edges, nodes, episodes, communities.
+            Dict with edges, nodes, episodes, communities. When the graph is
+            configured but the search fails, the lists are empty and the dict
+            also carries ``"degraded": True, "error": "graph_unavailable"``
+            (absent on success). A graph that is not configured at all returns
+            the plain empty lists, unchanged.
         """
         g = self._get_graphiti()
         if g is None:
+            if getattr(self, "_graph_init_error", None):
+                # Configured but failed to initialise: an outage, not "off".
+                return _degraded_graph_result()
             return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
         from graphiti_core.search.search_config import SearchConfig
@@ -1382,7 +1754,9 @@ class SearchMixin:
         # Multi-user: search across the caller's private namespace + the
         # shared pool, plus project-scoped variants. Replaces the prior
         # cross-user `"global"`/`"project--..."` group_ids.
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
 
         # Audit 27 #10: never mutate the shared module-level recipe singleton
         # — deep-copy before setting the per-call limit.
@@ -1408,35 +1782,49 @@ class SearchMixin:
                     search_filter=_live_edges_filter(),
                 )
             )
-
-            return {
-                "edges": [
-                    {
-                        "uuid": e.uuid,
-                        "name": e.name,
-                        "fact": e.fact,
-                        "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
-                        "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
-                        "created_at": _dt_to_iso(getattr(e, "created_at", None)),
-                    }
-                    for e in results.edges
-                ],
-                "nodes": [
-                    {"uuid": n.uuid, "name": n.name, "summary": n.summary}
-                    for n in results.nodes
-                ],
-                "episodes": [
-                    {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
-                    for ep in results.episodes
-                ],
-                "communities": [
-                    {"uuid": c.uuid, "name": c.name}
-                    for c in results.communities
-                ],
-            }
         except Exception as e:
+            # An outage (Neo4j down, bridge timeout, Graphiti error) must not
+            # read as "no facts": mark the empty result degraded so REST and
+            # MCP callers can tell the two apart.
             logger.error(f"Graph search failed: {e}")
-            return {"edges": [], "nodes": [], "episodes": [], "communities": []}
+            return _degraded_graph_result()
+
+        hidden_eps = self._tombstoned_episode_uuids(
+            [ep.uuid for ep in results.episodes]
+            + [u for e in results.edges for u in _episode_uuid_list(getattr(e, "episodes", None))]
+        )
+
+        def _hidden_edge(e) -> bool:
+            sup = _episode_uuid_list(getattr(e, "episodes", None))
+            return bool(hidden_eps and sup and all(u in hidden_eps for u in sup))
+
+        return {
+            "edges": [
+                {
+                    "uuid": e.uuid,
+                    "name": e.name,
+                    "fact": e.fact,
+                    "valid_at": _dt_to_iso(getattr(e, "valid_at", None)),
+                    "invalid_at": _dt_to_iso(getattr(e, "invalid_at", None)),
+                    "created_at": _dt_to_iso(getattr(e, "created_at", None)),
+                }
+                for e in results.edges
+                if not _hidden_edge(e)
+            ],
+            "nodes": [
+                {"uuid": n.uuid, "name": n.name, "summary": n.summary}
+                for n in results.nodes
+            ],
+            "episodes": [
+                {"uuid": ep.uuid, "name": ep.name, "content": ep.content}
+                for ep in results.episodes
+                if ep.uuid not in hidden_eps
+            ],
+            "communities": [
+                {"uuid": c.uuid, "name": c.name}
+                for c in results.communities
+            ],
+        }
 
     def keyword_search(
         self,
@@ -1455,6 +1843,9 @@ class SearchMixin:
         embeddings under-recall exhaustive "list every X" sets, so the ask
         path runs this exact pass *before* semantic search and dedups the
         union.
+
+        Reference workspaces are fenced out (memory workspace only), as in
+        default recall and the session-start context.
 
         Visibility mirrors search's pool union (caller's own rows at any
         visibility + shared + standard-when-enabled; ``project_id`` adds the
@@ -1507,6 +1898,10 @@ class SearchMixin:
                     ]
                 )
             )
+        # Reference workspaces stay out of the scan, exactly as they stay out
+        # of default recall and the session-start context: the same
+        # Qdrant-side condition, so the scan's point cap is never spent on them.
+        must.append(_workspace_filter(_effective_workspaces(None)))
         flt = Filter(
             must=must,
             must_not=[
@@ -1643,6 +2038,37 @@ class SearchMixin:
         )
         fused = [e["row"] for e in entries]
         return fused if limit is None else fused[:limit]
+
+    @staticmethod
+    def _truncate_keeping_episode_rows(
+        combined: list[MemoryResponse], limit: int
+    ) -> list[MemoryResponse]:
+        """Top-``limit`` of the fused list, without the episode leg being starved.
+
+        Verbatim-episode rows carry no score, so fusion ranks them below every
+        scored row. When the vector and graph legs alone fill ``limit`` (the
+        usual case on a populated project) a plain slice dropped every episode
+        row and the leg never surfaced. The leg is additive and capped (at
+        most 3 rows), so the rows that would have been cut are kept in the tail
+        and the lowest-ranked scored rows give up that many slots (rows already
+        inside the head stay where they are, the kept head order is unchanged):
+        the list never grows past ``limit``, and at most ``limit // 4`` slots are ever handed over, so a
+        small ``limit`` keeps its scored hits.
+        """
+        head = combined[:limit]
+        cut_episodes = [r for r in combined[limit:] if r.source == "episode"]
+        if not cut_episodes:
+            return head
+        in_head = sum(1 for r in head if r.source == "episode")
+        quota = max(0, limit // 4 - in_head)
+        # Rows already inside the head keep their place; only cut episode rows
+        # are appended, each taking the slot of the lowest-ranked scored row.
+        scored_positions = [i for i, r in enumerate(head) if r.source != "episode"]
+        n = min(len(cut_episodes), quota, len(scored_positions))
+        if n == 0:
+            return head
+        drop = set(scored_positions[-n:])
+        return [r for i, r in enumerate(head) if i not in drop] + cut_episodes[:n]
 
     def _merge_results(self, *result_sets) -> list[dict]:
         """Merge multiple result sets, deduplicate by ID, sort by score descending."""

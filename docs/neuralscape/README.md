@@ -20,6 +20,7 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 | 21 | [Document & File Ingestion](./21-document-ingestion.md) | Ingest files/folders/zips + manual context; Docling/MarkItDown parsing; artifact storage; dedicated ingest worker |
 | 28 | [Hybrid Inference Evaluation](./28-hybrid-inference-evaluation.md) | Decision-model and small-local-model feasibility, graph/vector acceptance checks, measured cost/latency, limitations and opt-in testing |
 | 29 | [Source Extraction Evaluation](./29-source-extraction-evaluation.md) | Source-selection redesign, held-out extraction benchmarks, graph/vector validation and fallback tradeoffs |
+| 31 | [Usage Scenario Reports](./31-usage-scenario-reports.md) | Per-person scenario reports and the usage pilot |
 
 ## Quick links by audience
 
@@ -30,6 +31,7 @@ Comprehensive reference for the Neuralscape codebase. Read in order or jump to w
 - **"I'm interfacing via MCP from a client agent."** → [08-mcp-server](./08-mcp-server.md) for the 7 tools, [03-memory-model](./03-memory-model.md) for the category enums.
 - **"I'm debugging a stuck async write."** → [07-async-pipeline](./07-async-pipeline.md), then [06-storage-backends](./06-storage-backends.md), then [11-deployment](./11-deployment.md).
 - **"I'm building the web UI."** → [12-ui-prd](./12-ui-prd.md) for the feature scope, then [03-memory-model](./03-memory-model.md) and [02-service-architecture](./02-service-architecture.md) for the data shapes the UI consumes.
+- **"I want the access-control design and roadmap."** → [ACCESS_MODEL_V2](../ACCESS_MODEL_V2.md) (threat model, provenance-based access control, phased roadmap with implementation status).
 
 ## Source of truth
 

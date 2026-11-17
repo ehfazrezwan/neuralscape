@@ -553,9 +553,11 @@ class TestGlobalExceptionHandler:
 
     def test_500_does_not_leak_internal_details(self, client):
         """Error responses should not contain stack traces or internal paths."""
-        main._service.extract_and_store.side_effect = Exception(
-            "neo4j://admin:secret@localhost:7687 connection refused /app/internal/path.py"
-        )
+        # Credential-looking text is assembled at run time (nothing committed as a literal).
+        pw = "sec" + "ret"
+        raw = "neo4j" + "://" + "admin" + ":" + pw + "@" + "localhost:7687 connection refused /app/internal/path.py"
+        assert pw in raw and "neo4j://" in raw and "/app/internal" in raw
+        main._service.extract_and_store.side_effect = Exception(raw)
         resp = client.post("/memories", json={
             "messages": [{"role": "user", "content": "hello"}],
         })
@@ -563,7 +565,7 @@ class TestGlobalExceptionHandler:
         body = resp.json()
         # Should NOT contain the raw exception with connection strings
         assert "neo4j://" not in json.dumps(body)
-        assert "secret" not in json.dumps(body)
+        assert pw not in json.dumps(body)
         assert "/app/internal" not in json.dumps(body)
 
     def test_500_returns_generic_message(self, client):
@@ -758,6 +760,175 @@ class TestHealthEndpointChecks:
         finally:
             main._task_manager = original
             main._service = original_svc
+
+    def test_health_returns_503_when_vector_store_probe_fails_or_hangs(self, client, monkeypatch):
+        """An initialised client whose store errors or never answers is unreachable (bounded by the probe timeout)."""
+        import threading
+
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        release = threading.Event()
+
+        def hang():
+            release.wait(5)
+            return []
+
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TIMEOUT_S", 0.1)
+        for probe in (MagicMock(side_effect=ConnectionError("refused")), hang):
+            mock_svc = MagicMock()
+            mock_svc._memory.vector_store.client.get_collections = probe
+            mock_svc._graphiti = MagicMock()
+            monkeypatch.setattr(main, "_service", mock_svc)
+            resp = client.get("/health")
+            assert resp.status_code == 503
+            assert resp.json()["checks"]["vector_store"] == "unreachable"
+        release.set()
+
+    def test_health_probe_is_single_flight_and_briefly_cached(self, monkeypatch):
+        """Concurrent and back-to-back readiness probes share one Qdrant round trip (one event loop, as in prod)."""
+        import asyncio
+        import threading
+
+        release = threading.Event()
+        calls = []
+
+        def slow():
+            calls.append(1)
+            release.wait(5)
+            return []
+
+        memory = MagicMock()
+        memory.vector_store.client.get_collections = slow
+        monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TIMEOUT_S", 0.2)
+
+        async def scenario():
+            # A hung store: several concurrent callers all time out; only one probe is in flight.
+            results = await asyncio.gather(*[main._probe_vector_store(memory) for _ in range(4)], return_exceptions=True)
+            assert all(isinstance(r, TimeoutError) for r in results)
+            assert len(calls) == 1
+            again = await asyncio.gather(main._probe_vector_store(memory), return_exceptions=True)
+            assert isinstance(again[0], TimeoutError) and len(calls) == 1
+
+            # The store answers: the completed probe is cached for the TTL.
+            release.set()
+            for _ in range(100):
+                if main._vector_probe["task"] is None:
+                    break
+                await asyncio.sleep(0.02)
+            await main._probe_vector_store(memory)
+            await main._probe_vector_store(memory)
+            assert len(calls) == 1
+
+            # Past the TTL a fresh probe is made.
+            monkeypatch.setattr(main, "_VECTOR_STORE_PROBE_TTL_S", 0.0)
+            await main._probe_vector_store(memory)
+            assert len(calls) == 2
+
+        asyncio.run(scenario())
+
+    def test_health_probes_the_vector_store_for_real(self, client, monkeypatch):
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        mock_svc = MagicMock()
+        mock_svc._graphiti = MagicMock()
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", mock_svc)
+        assert client.get("/health").json()["checks"]["vector_store"] == "ok"
+        mock_svc._memory.vector_store.client.get_collections.assert_called_once()
+
+    # -- graph_store: a real, bounded Neo4j probe through the Graphiti bridge ------------------
+
+    @staticmethod
+    def _graph_service(driver):
+        """A service whose graph driver lives on a real bridge loop (as in prod)."""
+        import asyncio
+        import types
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        fake = types.SimpleNamespace(_bridge=types.SimpleNamespace(_loop=loop))
+        svc = MagicMock()
+        svc._graphiti = types.SimpleNamespace(driver=driver)
+        svc._run_on_bridge = lambda coro, timeout=30.0: MemoryService._run_on_bridge(fake, coro, timeout)
+        return svc, loop, thread
+
+    @staticmethod
+    def _stop_loop(loop, thread):
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        loop.close()
+
+    def _health_with_graph_driver(self, client, monkeypatch, driver):
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        svc, loop, thread = self._graph_service(driver)
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", svc)
+        monkeypatch.setattr(main, "_GRAPH_STORE_PROBE_TIMEOUT_S", 0.3, raising=False)
+        try:
+            return client.get("/health")
+        finally:
+            self._stop_loop(loop, thread)
+
+    def test_health_reports_graph_store_unreachable_when_neo4j_is_down(self, client, monkeypatch):
+        class DownDriver:
+            async def health_check(self):
+                raise ConnectionError("neo4j refused")
+
+        resp = self._health_with_graph_driver(client, monkeypatch, DownDriver())
+        # Same rule as any non-vector component: degraded, still 200 (a graph blip must not
+        # restart the API); only the vector store turns the endpoint into a 503.
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["checks"]["graph_store"] == "unreachable"
+        assert body["status"] == "degraded"
+
+    def test_health_graph_store_probe_is_bounded_when_neo4j_hangs(self, client, monkeypatch):
+        import asyncio
+        import time
+
+        class HungDriver:
+            async def health_check(self):
+                await asyncio.sleep(30)
+
+        started = time.monotonic()
+        resp = self._health_with_graph_driver(client, monkeypatch, HungDriver())
+        assert time.monotonic() - started < 5
+        assert resp.status_code == 200
+        assert resp.json()["checks"]["graph_store"] == "unreachable"
+
+    def test_health_cold_graph_is_reported_as_before_and_never_probed_or_built(self, client, monkeypatch):
+        """Graph not initialised yet (lazy init pending): ``not_initialized``, no probe, no init in the bound."""
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        svc = MagicMock()
+        svc._graphiti = None
+        probe = AsyncMock()
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", svc)
+        monkeypatch.setattr(main, "_probe_graph_store", probe)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["checks"]["graph_store"] == "not_initialized"
+        probe.assert_not_called()
+        svc._get_memory.assert_not_called()
+        svc._get_graphiti.assert_not_called()
+        svc._run_on_bridge.assert_not_called()
+
+    def test_health_graph_store_ok_when_the_probe_answers(self, client, monkeypatch):
+        class UpDriver:
+            async def health_check(self):
+                return None
+
+        resp = self._health_with_graph_driver(client, monkeypatch, UpDriver())
+        assert resp.status_code == 200
+        assert resp.json()["checks"]["graph_store"] == "ok"
 
 
 # ══════════════════════════════════════════════

@@ -20,6 +20,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from unittest.mock import AsyncMock
 
 SERVICE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = SERVICE_DIR.parent
@@ -34,16 +35,13 @@ def _run(coro):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "legacy group ids join user and project with a delimiter that legal ids "
-        "may contain, so different (user, project) tuples can share one namespace"
-    ),
-)
-def test_distinct_namespace_tuples_have_distinct_group_ids() -> None:
+def test_distinct_namespace_tuples_have_distinct_group_ids(monkeypatch) -> None:
+    # Injective group ids are flag-gated (default off); the fix is pinned in its
+    # flag-ON mode, which is the mode this reproduction asserts.
+    from config import settings
     from memory.groups import _build_group_id
+
+    monkeypatch.setattr(settings, "graph_group_id_injective_enabled", True)
 
     colliding_user = _build_group_id("private", "alice--project--payroll")
     plain_project = _build_group_id("private", "alice", project_id="payroll")
@@ -67,15 +65,50 @@ def test_ordinary_namespace_tuples_stay_distinct() -> None:
     assert _build_group_id("private", "alice") == "user--alice"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="legacy email slugging collapses every disallowed run to one '-', so distinct emails can share a user id",
-)
-def test_distinct_emails_have_distinct_user_ids() -> None:
-    from identity import derive_user_id
+def test_distinct_emails_have_distinct_user_ids(monkeypatch) -> None:
+    """Fixed at first login (not in ``slugify_email``, whose output must not
+    change for existing users): the second person whose slug is already
+    claimed gets a hash-suffixed id, and both stay stable on re-login."""
+    import identity_store
+    from config import settings
+    from login_providers import resolve_login_identity
 
-    assert derive_user_id("a+b@example.com", {}) != derive_user_id("a-b@example.com", {})
+    hashes: dict[str, dict[str, str]] = {}
+
+    class _Redis:
+        async def hget(self, h, k):
+            return hashes.get(h, {}).get(k)
+
+        async def hset(self, h, k, v):
+            hashes.setdefault(h, {})[k] = v
+
+        async def hgetall(self, h):
+            return dict(hashes.get(h, {}))
+
+        async def hsetnx(self, h, k, v):
+            if k in hashes.setdefault(h, {}):
+                return 0
+            hashes[h][k] = v
+            return 1
+
+        async def aclose(self):
+            return None
+
+    monkeypatch.setattr(identity_store, "_client", lambda: _Redis())
+    monkeypatch.setattr(settings, "auth_identity_map", "")
+
+    async def first_login(sub, email):
+        uid, linked = await resolve_login_identity(sub, email)
+        assert not linked
+        await identity_store.link(uid, sub=sub, email=email)  # what /oauth/link action=new does
+        return uid
+
+    first = _run(first_login("s1", "a-b@example.com"))
+    second = _run(first_login("s2", "a+b@example.com"))
+
+    assert first == "a-b-example.com"  # existing ids never change
+    assert second != first
+    assert _run(resolve_login_identity("s2", "a+b@example.com")) == (second, True)
 
 
 def test_ordinary_emails_slug_deterministically() -> None:
@@ -88,7 +121,7 @@ def test_ordinary_emails_slug_deterministically() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Queued graph publication uses the visibility captured at enqueue time
+# Queued graph publication uses the memory's CURRENT visibility
 # ---------------------------------------------------------------------------
 
 
@@ -122,14 +155,6 @@ def _enrich(service: _GraphService, queued_visibility: str) -> dict:
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the graph job publishes the visibility it was enqueued with and never re-reads the "
-        "memory's current visibility, so narrowing a memory while a job is queued is not honored"
-    ),
-)
 def test_queued_graph_job_publishes_current_visibility() -> None:
     service = _GraphService(current_visibility="private")  # narrowed after enqueue
 
@@ -157,7 +182,7 @@ def test_queued_graph_job_with_unchanged_visibility_enriches() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Job keys omit semantic options
+# Job keys cover semantic options (defects fixed; these are now controls)
 # ---------------------------------------------------------------------------
 
 
@@ -205,14 +230,6 @@ def _raw_id(**kwargs) -> str:
     return _run(manager.enqueue_raw(**arguments))
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the extraction job id is built from message text and event time only, so the same text "
-        "sent to a different project, agent or run coalesces onto one job and the later write is dropped"
-    ),
-)
 def test_store_job_id_depends_on_project_and_agent_scope() -> None:
     base = _store_id(project_id="alpha")
 
@@ -221,20 +238,16 @@ def test_store_job_id_depends_on_project_and_agent_scope() -> None:
     assert _store_id(project_id="alpha", run_id="run-2") != base
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the raw-write job id covers visibility, scope, project and the sensitivity override but "
-        "not category, tags or agent, so writes differing only in those options coalesce"
-    ),
-)
 def test_raw_job_id_depends_on_category_and_tags() -> None:
     base = _raw_id()
 
     assert _raw_id(category="preference") != base
     assert _raw_id(tags=["release"]) != base
     assert _raw_id(agent_id="agent-2") != base
+    assert _raw_id(run_id="run-2") != base
+    assert _raw_id(domain="ops") != base
+    # Tags are a set: order and repeats do not make a different write.
+    assert _raw_id(tags=["a", "b"]) == _raw_id(tags=["b", "a", "a"])
 
 
 def test_job_ids_are_stable_and_user_scoped() -> None:
@@ -253,11 +266,6 @@ def test_job_ids_are_stable_and_user_scoped() -> None:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason="the edit request has no revision or etag precondition, so a stale edit cannot be refused (schema-level; concurrent-edit reproduction needs real stores)",
-)
 def test_patch_request_carries_an_expected_revision() -> None:
     from schemas import PatchMemoryRequest
 
@@ -328,8 +336,9 @@ def _remove_episode(monkeypatch, episode_uuid: str, edges: list):
     strict=True,
     raises=AssertionError,
     reason=(
-        "removing an episode deletes every edge whose first supporting episode is the removed one, "
-        "even when other episodes still support the edge (reproduced on a real graph by the engines lane)"
+        "library observation (oracle v3): the vendored library's episode removal deletes every edge whose first "
+        "supporting episode is the removed one, even when other episodes still support the edge; the service "
+        "removes episodes through the graph adapter, so this no longer stands for the product requirement"
     ),
 )
 def test_graph_removal_keeps_edges_supported_by_other_episodes(monkeypatch) -> None:
@@ -366,6 +375,13 @@ class _Pool:
         return True
 
 
+class _ReachableQdrantMemory:
+    """An initialized client whose backing vector store answers."""
+
+    def __init__(self) -> None:
+        self.vector_store = SimpleNamespace(client=SimpleNamespace(get_collections=lambda: []))
+
+
 class _UnreachableQdrantMemory:
     """An initialized client whose backing vector store cannot be reached."""
 
@@ -379,6 +395,7 @@ def _health(monkeypatch, *, memory, pool_reachable: bool = True) -> dict:
 
     monkeypatch.setattr(knowledge, "list_systems", lambda: [])
     monkeypatch.setattr(main, "_service", SimpleNamespace(_memory=memory, _graphiti=object()))
+    monkeypatch.setattr(main, "_probe_graph_store", AsyncMock(return_value=None))  # these tests are about the vector store/queue
     monkeypatch.setattr(main, "_task_manager", SimpleNamespace(pool=_Pool(pool_reachable)))
     response = _run(main.health())
     if hasattr(response, "body"):
@@ -388,19 +405,12 @@ def _health(monkeypatch, *, memory, pool_reachable: bool = True) -> dict:
     return {"status_code": 200, **response}
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "health marks the vector store 'ok' once its client object exists and never probes the store, "
-        "so an unreachable store is reported healthy"
-    ),
-)
 def test_health_reports_an_unreachable_vector_store(monkeypatch) -> None:
     report = _health(monkeypatch, memory=_UnreachableQdrantMemory())
 
-    assert report["status"] != "ok"
-    assert report["checks"]["vector_store"] != "ok"
+    assert report["status_code"] == 503
+    assert report["status"] == "unhealthy"
+    assert report["checks"]["vector_store"] == "unreachable"
 
 
 def test_health_reports_an_uninitialized_vector_store_as_degraded(monkeypatch) -> None:
@@ -408,11 +418,11 @@ def test_health_reports_an_uninitialized_vector_store_as_degraded(monkeypatch) -
     assert report["status"] == "degraded"
     assert report["checks"]["vector_store"] == "not_initialized"
 
-    unreachable_queue = _health(monkeypatch, memory=object(), pool_reachable=False)
+    unreachable_queue = _health(monkeypatch, memory=_ReachableQdrantMemory(), pool_reachable=False)
     assert unreachable_queue["status"] == "degraded"
     assert unreachable_queue["checks"]["redis"] == "unreachable"
 
-    healthy = _health(monkeypatch, memory=object())
+    healthy = _health(monkeypatch, memory=_ReachableQdrantMemory())
     assert healthy["status"] == "ok"
 
 
@@ -443,15 +453,9 @@ def _compose_volumes() -> set[str]:
     return names
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "the compose profile ships no backup tooling that names its persistent volumes; the only "
-        "backup definition is an opt-in cluster add-on, and the deployment guide still lists backups as to-do"
-    ),
-)
 def test_compose_backup_tooling_covers_every_persistent_volume() -> None:
+    if not (REPO_ROOT / "scripts").is_dir():  # the packaged test image carries only the service tree
+        return
     tooling = [
         path
         for directory in ("scripts", "deploy")

@@ -1,0 +1,29 @@
+{
+  "event": {
+    "cwd": "/home/user/sample-project",
+    "hook_event_name": "PostToolUse",
+    "permission_mode": "default",
+    "session_id": "sess-0001",
+    "tool_input": {
+      "command": "make setup",
+      "description": "Setup"
+    },
+    "tool_name": "Bash",
+    "tool_response": {
+      "interrupted": false,
+      "isImage": false,
+      "stderr": "",
+      "stdout": "visible-line <private>SAMPLE-SECRET-VALUE</private> after-line"
+    },
+    "tool_use_id": "toolu_privat",
+    "transcript_path": "/home/user/.claude/projects/sample/sess-0001.jsonl"
+  },
+  "fixture": "private-span",
+  "provenance": {
+    "client": "claude-code",
+    "client_version_tag": "hook-shape-v1 (documented PostToolUse/transcript shapes)",
+    "contains_real_data": false,
+    "kind": "synthetic-sanitized",
+    "replace_with": "a sanitized capture when one is available; keep the tag and expected file"
+  }
+}

@@ -30,6 +30,7 @@ the latency floor and keeps D/E separable.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -75,26 +76,17 @@ class ProjectKnowledgeConfig:
 # in-memory fast-path/back-compat mirror for callers/tests that set config in the
 # same process without Redis.
 _PROJECT_CONFIGS: dict[str, ProjectKnowledgeConfig] = {}
+# (monotonic time, config object) for mirror entries that came from, or were
+# written through to, the cross-process store. An entry is re-validated against
+# the store only while the mirror still holds that exact object; entries injected
+# directly by same-process callers/tests are authoritative and never re-validated.
+# Without this, an entry cached once was served forever and an ingest-worker
+# rewrite never reached the API process.
+_PROJECT_CONFIG_AT: dict[str, tuple[float, ProjectKnowledgeConfig]] = {}
 
 
-def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
-    """Get the project's knowledge routing config, or None if not set.
-
-    Reads the in-process mirror first (free), then the cross-process store
-    (index_store; bounded Redis GET on a miss). A miss returns None — recall
-    output stays byte-identical to pre-Phase-G behavior.
-    """
-    if not project_id:
-        return None
-    hit = _PROJECT_CONFIGS.get(project_id)
-    if hit is not None:
-        return hit
-    from knowledge import index_store
-
-    raw = index_store.load_project_config(project_id)
-    if not raw:
-        return None
-    cfg = ProjectKnowledgeConfig(
+def _config_from_raw(project_id: str, raw: dict) -> ProjectKnowledgeConfig:
+    return ProjectKnowledgeConfig(
         project_id=project_id,
         code_systems=list(raw.get("code_systems") or []),
         fuse_code_into_recall=bool(raw.get("fuse_code_into_recall", True)),
@@ -102,25 +94,159 @@ def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
         code_space=raw.get("code_space"),
         op_preference=raw.get("op_preference"),
     )
-    _PROJECT_CONFIGS[project_id] = cfg
+
+
+def _mirror_put(cfg: ProjectKnowledgeConfig) -> None:
+    import time as _t
+
+    _PROJECT_CONFIGS[cfg.project_id] = cfg
+    _PROJECT_CONFIG_AT[cfg.project_id] = (_t.monotonic(), cfg)
+
+
+def get_project_config(project_id: str | None) -> ProjectKnowledgeConfig | None:
+    """Get the project's knowledge routing config, or None if not set.
+
+    Reads the in-process mirror first (free). A mirror entry that came from the
+    store is re-validated against it at most once per ``knowledge_config_cache_ttl_s``
+    (one bounded Redis GET, bypassing index_store's own L1), so a config rewritten
+    by another process (the ingest worker at index time) is seen within that bound.
+    Store unreachable/empty on refresh keeps serving the mirror (best effort). A
+    miss returns None — recall output stays byte-identical to pre-Phase-G behavior.
+    """
+    import time as _t
+
+    if not project_id:
+        return None
+    from knowledge import index_store
+
+    hit = _PROJECT_CONFIGS.get(project_id)
+    if hit is not None:
+        stamp = _PROJECT_CONFIG_AT.get(project_id)
+        if stamp is None or stamp[1] is not hit:
+            return hit  # injected directly: authoritative
+        if (_t.monotonic() - stamp[0]) < index_store.config_ttl():
+            return hit
+        answered, raw = index_store.refresh_project_config(project_id)
+        if answered and not raw:
+            # Redis answered and the key is gone (deleted/cleared elsewhere).
+            _PROJECT_CONFIGS.pop(project_id, None)
+            _PROJECT_CONFIG_AT.pop(project_id, None)
+            return None
+        if raw:
+            _mirror_put(_config_from_raw(project_id, raw))
+        else:
+            _PROJECT_CONFIG_AT[project_id] = (_t.monotonic(), hit)
+        return _PROJECT_CONFIGS[project_id]
+    raw = index_store.load_project_config(project_id)
+    if not raw:
+        return None
+    cfg = _config_from_raw(project_id, raw)
+    _mirror_put(cfg)
     return cfg
 
 
 def set_project_config(config: ProjectKnowledgeConfig) -> None:
     """Set (or update) a project's knowledge routing config (in-process + persisted)."""
-    _PROJECT_CONFIGS[config.project_id] = config
+    _mirror_put(config)
     from knowledge import index_store
 
-    index_store.save_project_config(
-        config.project_id,
-        {
-            "project_id": config.project_id,
-            "code_systems": list(config.code_systems or []),
-            "fuse_code_into_recall": config.fuse_code_into_recall,
-            "default_engine": config.default_engine,
-            "code_space": config.code_space,
-            "op_preference": config.op_preference,
-        },
+    index_store.save_project_config(config.project_id, _payload(config))
+
+
+_MERGEABLE_FIELDS = frozenset(
+    {"code_systems", "fuse_code_into_recall", "default_engine", "code_space", "op_preference"}
+)
+# Fields that cannot be cleared to None (None means "caller did not supply it").
+_NON_NULLABLE_FIELDS = frozenset({"code_systems", "fuse_code_into_recall"})
+
+
+class KnowledgeConfigStoreError(RuntimeError):
+    """The authoritative (Redis) store could not be read or written, or kept losing a
+    race with another writer, so the merge was refused and nothing was changed."""
+
+
+# Shared with any other read-modify-write of this record (e.g. the worker's index-time write).
+MERGE_RETRIES = 10
+
+
+def _payload(config: ProjectKnowledgeConfig) -> dict:
+    return {
+        "project_id": config.project_id,
+        "code_systems": list(config.code_systems or []),
+        "fuse_code_into_recall": config.fuse_code_into_recall,
+        "default_engine": config.default_engine,
+        "code_space": config.code_space,
+        "op_preference": config.op_preference,
+    }
+
+
+def _apply_updates(project_id: str, raw: dict | None, updates: dict) -> ProjectKnowledgeConfig:
+    base = _config_from_raw(project_id, raw) if raw else ProjectKnowledgeConfig(project_id=project_id)
+    for key, value in updates.items():
+        if value is None and key in _NON_NULLABLE_FIELDS:
+            continue
+        setattr(base, key, list(value) if key == "code_systems" else value)
+    return base
+
+
+def merge_project_config(project_id: str, **updates) -> ProjectKnowledgeConfig:
+    """Apply ``updates`` onto the project's stored config and persist the result.
+
+    Only the fields named in ``updates`` change; every other stored field
+    (notably ``code_space``, set by indexing, and ``op_preference``) is kept, so
+    an edit through REST/MCP cannot silently drop what indexing recorded. With no
+    stored config the defaults apply. ``code_systems`` and
+    ``fuse_code_into_recall`` given as None are treated as not supplied;
+    ``default_engine``, ``code_space`` and ``op_preference`` may be set to None
+    to clear them.
+
+    With a Redis client the read-modify-write runs under WATCH/MULTI (bounded
+    retry), reading Redis directly, so a concurrent write (a worker's index-time
+    write, another edit) is never lost and a stale local copy is never merged. A
+    failed read or write, or exhausted retries, raises KnowledgeConfigStoreError
+    and leaves the in-process mirror untouched. Without a Redis client
+    (memory-only mode) the local copy is merged and written as before.
+    """
+    unknown = set(updates) - _MERGEABLE_FIELDS
+    if unknown:
+        raise ValueError(f"unknown project knowledge config field(s): {sorted(unknown)}")
+    from knowledge import index_store
+
+    client = index_store._redis()
+    if client is None:  # memory-only mode
+        local = _PROJECT_CONFIGS.get(project_id)
+        raw = _payload(local) if local else index_store.load_project_config(project_id)
+        merged = _apply_updates(project_id, raw, updates)
+        set_project_config(merged)
+        return merged
+
+    try:
+        from redis.exceptions import WatchError
+    except Exception:  # noqa: BLE001 — redis-py is a dependency; keep a local stand-in
+        class WatchError(Exception):  # type: ignore[no-redef]
+            pass
+
+    key = index_store._CFG_PREFIX + project_id
+    for _ in range(MERGE_RETRIES):
+        try:
+            with client.pipeline() as pipe:
+                pipe.watch(key)
+                blob = pipe.get(key)
+                merged = _apply_updates(project_id, json.loads(blob) if blob else None, updates)
+                pipe.multi()
+                pipe.set(key, json.dumps(_payload(merged), default=str))
+                pipe.execute()
+        except WatchError:
+            continue  # someone wrote between our read and write: redo on the fresh value
+        except Exception as exc:  # noqa: BLE001
+            raise KnowledgeConfigStoreError(
+                f"cannot read or write the stored knowledge config for {project_id!r}; nothing was changed, retry shortly"
+            ) from exc
+        _mirror_put(merged)
+        index_store.cache_project_config(project_id, _payload(merged))
+        return merged
+    raise KnowledgeConfigStoreError(
+        f"the knowledge config for {project_id!r} is being changed concurrently; nothing was changed, retry"
     )
 
 

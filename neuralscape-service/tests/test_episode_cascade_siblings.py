@@ -56,11 +56,22 @@ def _dig(payload, dotted):
     return cur
 
 
-def _match(cond, payload) -> bool:
-    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+def _match(cond, payload, pid=None) -> bool:
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        HasIdCondition,
+        IsEmptyCondition,
+        MatchAny,
+        MatchValue,
+    )
 
     if isinstance(cond, Filter):
-        return _eval(cond, payload)
+        return _eval(cond, payload, pid)
+    if isinstance(cond, HasIdCondition):
+        return pid in [str(i) for i in cond.has_id]
+    if isinstance(cond, IsEmptyCondition):
+        return _dig(payload, cond.is_empty.key) in (None, [], "")
     assert isinstance(cond, FieldCondition), cond
     val = _dig(payload, cond.key)
     m = cond.match
@@ -71,12 +82,12 @@ def _match(cond, payload) -> bool:
     raise AssertionError(f"unsupported match {m!r}")
 
 
-def _eval(flt, payload) -> bool:
+def _eval(flt, payload, pid=None) -> bool:
     if flt is None:
         return True
-    if any(not _match(c, payload) for c in (flt.must or [])):
+    if any(not _match(c, payload, pid) for c in (flt.must or [])):
         return False
-    if flt.should and not any(_match(c, payload) for c in flt.should):
+    if flt.should and not any(_match(c, payload, pid) for c in flt.should):
         return False
     return True
 
@@ -110,7 +121,17 @@ class FakeQdrant:
         nxt = start + limit if start + limit < len(items) else None
         return [SimpleNamespace(id=k, payload=v) for k, v in page], nxt
 
+    def retrieve(self, collection_name, ids, with_payload=True, with_vectors=False):
+        return [SimpleNamespace(id=i, payload=self.points[i]) for i in ids if i in self.points]
+
+    def update_vectors(self, collection_name, points):
+        for pv in points:
+            if pv.id not in self.points:
+                raise KeyError(pv.id)
+
     def set_payload(self, collection_name, payload, points, key=None):
+        if not isinstance(points, list):      # a Filter (the edit compare-and-set): never creates a point
+            points = [pid for pid, v in self.points.items() if _eval(points, v, pid)]
         self.set_payload_calls.append({"payload": payload, "points": list(points), "key": key})
         for pid in points:
             target = self.points[pid]
@@ -290,8 +311,12 @@ class FakeGraph:
 
 
 @pytest.fixture
-def world():
+def world(monkeypatch):
     from memory_service import MemoryService
+    from tests.test_dedup import _UpRedis
+
+    up = _UpRedis()  # dedup takes pool locks and does nothing destructive without Redis
+    monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda: up)
 
     q = FakeQdrant()
     g = FakeGraph()
@@ -303,6 +328,7 @@ def world():
     mem.vector_store.delete.side_effect = q.delete
     mem.vector_store.get.side_effect = q.vs_get
     mem.vector_store.update.side_effect = q.vs_update
+    mem.vector_store._has_bm25_slot = False
     mem.vector_store.client = q
     svc._memory = mem
     svc._graphiti = MagicMock(name="Graphiti")
@@ -323,7 +349,7 @@ FACTS = [
 ]
 
 
-def seed_conversation(w, *, n=6, user=OWNER, tag="c1", ref_name=True, start=1):
+def seed_conversation(w, *, n=6, user=OWNER, tag="c1", ref_name=True, start=1, stamp_owner=True):
     """One conversation episode -> n fact rows, all stamped with the same refs."""
     group = f"user--{user}"
     ep_uuid, ep_name = f"ep-{tag}", f"mem0_episode_{tag}"
@@ -339,6 +365,11 @@ def seed_conversation(w, *, n=6, user=OWNER, tag="c1", ref_name=True, start=1):
         if ref_name:
             meta["graph_episode_name"] = ep_name
         w.q.add(pid, fact, user_id=user, **meta)
+        if not stamp_owner:
+            # real conversation extraction (_batch_store_facts) writes NO
+            # owner_user_id/visibility into metadata; only payload user_id
+            w.q.meta(pid).pop("owner_user_id")
+            w.q.meta(pid).pop("visibility")
     return SimpleNamespace(ids=ids, facts=facts, uuid=ep_uuid, name=ep_name,
                            edges=edge_uuids, group=group)
 
@@ -519,6 +550,17 @@ def _listed(ids, visibility="private"):
     return [SimpleNamespace(id=i, visibility=visibility) for i in ids]
 
 
+def _stub_listing(world, ids, visibilities=None):
+    """The filtered bulk-delete sweep lists RAW mem0 dicts via ``Memory.get_all``; serve ``ids`` that way."""
+    vis = visibilities or ["private"] * len(ids)
+    rows = [
+        {"id": i, "memory": "x", "metadata": {"metadata": {"visibility": v}}}
+        for i, v in zip(ids, vis)
+    ]
+    world.svc._ensure_filter_indexes = lambda: None
+    world.svc._memory.get_all = lambda filters, top_k: {"results": rows[:top_k]}
+
+
 class TestBulkDelete:
     def test_all_n_deleted_no_jobs_episode_cascaded_once(self, world):
         w = world
@@ -536,7 +578,7 @@ class TestBulkDelete:
     def test_subset_delete_returns_jobs_only_for_survivors(self, world):
         w = world
         conv = seed_conversation(w, n=6)
-        w.svc.list_memories = MagicMock(return_value=_listed(conv.ids[:3]))
+        _stub_listing(w, conv.ids[:3])
         out = w.svc.delete_memories(user_id=OWNER, category="personal_fact")
 
         assert set(conv.ids[:3]).isdisjoint(w.q.points)
@@ -731,6 +773,12 @@ class TestMalformedId:
         with pytest.raises(LookupError):
             w.svc.delete_memory("not-a-uuid", OWNER)
 
+    def test_wellformed_missing_id_is_lookup_error_not_a_store_call(self, world):
+        w = world
+        with pytest.raises(LookupError):
+            w.svc.delete_memory(rid(999), OWNER)
+        w.svc._memory.delete.assert_not_called()  # nothing was sent to the store
+
     def test_wellformed_id_store_failure_still_propagates(self, world):
         w = world
         w.svc._memory.get.side_effect = ConnectionError("qdrant down")
@@ -843,7 +891,7 @@ class TestRestSurface:
 
     def test_bulk_delete_subset_enqueues_only_survivors(self, world, rest):
         conv = seed_conversation(world, n=6)
-        world.svc.list_memories = MagicMock(return_value=_listed(conv.ids[:2]))
+        _stub_listing(world, conv.ids[:2])
         resp = rest.client.request(
             "DELETE", "/v1/memories", json={"user_id": OWNER, "category": "personal_fact"}
         )
@@ -863,6 +911,14 @@ class TestRestSurface:
     def test_malformed_id_is_404_not_500(self, world, rest):
         world.svc._memory.get.side_effect = ValueError("Point id is not a valid UUID")
         assert rest.client.delete("/v1/memories/not-a-uuid").status_code == 404
+
+    def test_unknown_wellformed_id_is_404_not_500(self, world, rest):
+        resp = rest.client.delete(f"/v1/memories/{rid(999)}")
+        assert resp.status_code == 404, resp.text
+
+    def test_wellformed_id_store_failure_is_still_500(self, world, rest):
+        world.svc._memory.get.side_effect = ConnectionError("qdrant down")
+        assert rest.client.delete(f"/v1/memories/{rid(1)}").status_code == 500
 
     def test_other_users_rows_untouched(self, world, rest):
         conv = seed_conversation(world, n=3)
@@ -891,7 +947,7 @@ class TestMcpSurface:
         import json
 
         conv = seed_conversation(world, n=5)
-        world.svc.list_memories = MagicMock(return_value=_listed(conv.ids[:1]))
+        _stub_listing(world, conv.ids[:1])
         mcp.tm.enqueue_graph_enrichment.side_effect = ConnectionError("redis down")
         out = await mcp_server.call_tool(
             "delete_memories", {"user_id": OWNER, "category": "personal_fact"}
@@ -913,6 +969,15 @@ class TestMcpSurface:
         assert data["graph"] == "migration_queued"
         assert data["sibling_graph_jobs_enqueued"] == 3
         assert _enqueued_ids(mcp.tm) == sorted(conv.ids)
+
+    @pytest.mark.asyncio
+    async def test_unknown_wellformed_id_returns_not_found_error(self, world, mcp):
+        import json
+
+        out = await mcp_server.call_tool(
+            "delete_memories", {"user_id": OWNER, "memory_id": rid(999)}
+        )
+        assert "not found" in json.loads(out[0].text)["error"].lower()
 
     @pytest.mark.asyncio
     async def test_malformed_id_returns_error_not_crash(self, world, mcp):
@@ -1188,10 +1253,7 @@ class TestDeleteEditPermissionMatrix:
     def test_filtered_delete_skips_shared_unless_asked_and_standard_unless_dictator(self, world):
         for i, vis in enumerate(("private", "shared", "standard"), start=1):
             self._row(world, rid(i), vis)
-        world.svc.list_memories = MagicMock(return_value=[
-            SimpleNamespace(id=rid(i), visibility=v)
-            for i, v in enumerate(("private", "shared", "standard"), start=1)
-        ])
+        _stub_listing(world, [rid(i) for i in (1, 2, 3)], ["private", "shared", "standard"])
         out = world.svc.delete_memories(user_id=OWNER, category="personal_fact")
         assert set(world.q.points) == {rid(2), rid(3)}
         assert "preserved 1 shared, 1 standard" in out["message"]
@@ -1224,3 +1286,224 @@ class TestDeleteEditPermissionMatrix:
     def test_missing_memory_is_lookup_error(self, world):
         with pytest.raises(LookupError):
             world.svc.patch_memory(rid(404), OWNER, {"tags": ["x"]})
+
+
+# ──────────────────────────────────────────────
+# Rows as the real conversation path writes them: no owner_user_id in metadata
+# ──────────────────────────────────────────────
+
+
+class TestOwnerlessConversationRows:
+    """Regression: the bulk/dedup paths handed the cascade rows with no owner,
+    so the group derived as ``user--`` and the episode was never found
+    (found by the first real-store integration run, teardown warning
+    'Nuke-all delete ... could not resolve/verify graph cleanup')."""
+
+    def test_nuke_all_resolves_and_removes_the_episode(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        out = w.svc.delete_memories(user_id=OWNER, include_shared=True)
+        assert out["graph_cascade_unresolved_ids"] == []
+        assert conv.uuid not in w.g.episodes and w.g.live_edges(conv.group) == []
+
+    def test_private_only_wipe_resolves_and_removes_the_episode(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        out = w.svc.delete_memories(user_id=OWNER)
+        assert out["graph_cascade_unresolved_ids"] == []
+        assert conv.uuid not in w.g.episodes
+        assert episode_recall(w, "Biscuit") == []
+
+    def test_null_category_path_resolves(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        w.svc._list_null_category_memories = MagicMock(return_value=[
+            {"id": i, "data": w.q.points[i]["data"], "metadata": w.q.points[i]["metadata"]}
+            for i in conv.ids[:1]
+        ])
+        out = w.svc.delete_memories(user_id=OWNER, filter_null_category=True)
+        assert out["graph_cascade_unresolved_ids"] == []
+        assert {j["memory_id"] for j in out["graph_jobs"]} == set(conv.ids[1:])
+        assert conv.uuid not in w.g.episodes
+
+    def test_dedup_delete_resolves_episode_and_repairs_siblings(self, world):
+        w = world
+        conv = seed_conversation(w, n=3, stamp_owner=False)
+        for pid in conv.ids:
+            w.q.points[pid]["hash"] = f"h-{pid}"
+            w.q.points[pid]["created_at"] = "2026-01-01"
+        w.q.points[conv.ids[0]]["hash"] = "H-dup"
+        w.q.add(rid(700), w.q.points[conv.ids[0]]["data"])
+        w.q.points[rid(700)]["hash"] = "H-dup"
+        w.q.points[rid(700)]["created_at"] = "2026-02-01"
+        w.q.meta(rid(700)).pop("owner_user_id")
+        w.q.meta(rid(700)).pop("visibility")
+        out = w.svc.dedup_memories(OWNER, semantic=False)
+        assert out["exact_duplicates_removed"] == 1
+        assert conv.uuid not in w.g.episodes
+        assert {j["memory_id"] for j in out["graph_jobs"]} == set(conv.ids[1:])
+
+    def test_expiry_sweep_collectorless_path_resolves(self, world):
+        w = world
+        conv = seed_conversation(w, n=2, stamp_owner=False)
+        w.svc._delete_qdrant_memory_with_graph_cleanup(conv.ids[0], w.q.points[conv.ids[0]])
+        assert conv.uuid not in w.g.episodes
+
+
+# ──────────────────────────────────────────────
+# TTL expiry sweep (expire_old_memories) repairs siblings like a bulk delete
+# ──────────────────────────────────────────────
+
+
+def _expire(w, *ids, when="2000-01-01T00:00:00+00:00"):
+    for i in ids:
+        w.q.meta(i)["expires_at"] = when
+
+
+class TestTtlSweep:
+    def test_expiring_one_fact_keeps_the_siblings_graph_evidence(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        _expire(w, conv.ids[0])
+
+        out = w.svc.expire_old_memories(batch_size=100)
+
+        assert out["deleted_count"] == 1 and out["per_user"] == {OWNER: 1}
+        assert conv.ids[0] not in w.q.points and all(i in w.q.points for i in conv.ids[1:])
+        for s in conv.ids[1:]:                       # stale refs cleared on the survivors
+            assert w.q.meta(s)["graph_episode_uuid"] is None
+        assert sorted(j["memory_id"] for j in out["graph_jobs"]) == sorted(conv.ids[1:])
+        assert out["graph_jobs_count"] == 3
+        assert out["graph_cascade_unresolved_ids"] == [] and out["graph_sibling_unrepaired_ids"] == []
+        assert conv.uuid not in w.g.episodes         # the episode holding the expired fact is gone
+
+    def test_cascade_runs_once_per_episode_for_several_expired_rows(self, world):
+        w = world
+        conv = seed_conversation(w, n=4)
+        _expire(w, conv.ids[0], conv.ids[1])
+
+        out = w.svc.expire_old_memories(batch_size=100)
+
+        assert out["deleted_count"] == 2
+        assert len(w.g.kinds("lookup_uuid")) == 1 and len(w.g.kinds("expire_episode_edges")) == 1
+        assert sorted(j["memory_id"] for j in out["graph_jobs"]) == sorted(conv.ids[2:])   # never an expired row
+
+    def test_whole_episode_expired_has_no_jobs(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        _expire(w, *conv.ids)
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 3 and out["graph_jobs"] == [] and out["graph_jobs_count"] == 0
+        assert w.q.points == {} and w.g.live_edges() == []
+
+    def test_unexpired_rows_and_other_episodes_are_untouched(self, world):
+        w = world
+        a = seed_conversation(w, n=2, tag="ca", start=1)
+        b = seed_conversation(w, n=2, tag="cb", start=10)
+        _expire(w, a.ids[0])
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert {j["memory_id"] for j in out["graph_jobs"]} == {a.ids[1]}
+        assert b.uuid in w.g.episodes and all(w.q.meta(i)["graph_episode_uuid"] == b.uuid for i in b.ids)
+
+    def test_unresolved_episode_is_reported(self, world):
+        w = world
+        w.q.add(rid(500), "orphan fact", graph_episode_uuid="ep-missing", expires_at="2000-01-01T00:00:00+00:00")
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 1
+        assert out["graph_cascade_unresolved_ids"] == [rid(500)]
+        assert "graph_jobs_count" in out
+
+    def test_graph_disabled_still_expires_and_reports_empty_graph_keys(self, world):
+        w = world
+        conv = seed_conversation(w, n=2)
+        _expire(w, conv.ids[0])
+        w.svc._graphiti = None
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 1 and out["graph_jobs"] == [] and out["graph_cascade_unresolved_ids"] == []
+
+    def test_cron_enqueues_the_sibling_jobs(self, world):
+        import worker
+
+        w = world
+        conv = seed_conversation(w, n=3)
+        _expire(w, conv.ids[0])
+        enqueued = []
+
+        async def fake_enqueue(ctx, jobs, adapter):
+            enqueued.extend(jobs)
+            return len(jobs)
+
+        ctx = {"service": w.svc}
+        orig = worker._enqueue_graph_jobs
+        worker._enqueue_graph_jobs = fake_enqueue
+        try:
+            out = asyncio.run(worker.expire_old_memories_cron(ctx))
+        finally:
+            worker._enqueue_graph_jobs = orig
+        assert sorted(j["memory_id"] for j in enqueued) == sorted(conv.ids[1:])
+        assert out["graph_jobs_enqueued"] == 2 and "graph_jobs" not in out
+
+
+class TestTtlSweepEdges:
+    def test_a_failing_graph_cleanup_leaves_vectors_deleted_and_is_reported(self, world):
+        w = world
+        conv = seed_conversation(w, n=3)
+        _expire(w, conv.ids[0])
+        w.svc._bulk_graph_cleanup = MagicMock(side_effect=RuntimeError("neo4j down"))
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["deleted_count"] == 1 and conv.ids[0] not in w.q.points
+        assert out["graph_cascade_unresolved_ids"] == [conv.ids[0]]
+        assert out["graph_jobs"] == [] and out["graph_jobs_count"] == 0
+
+    def test_sibling_repair_never_crosses_users(self, world):
+        """Episodes are per-user, but a row of another user carrying the same episode ref must not be repaired."""
+        w = world
+        conv = seed_conversation(w, n=2)                       # alice: ids[0] expires, ids[1] is the sibling
+        w.q.add(rid(77, 2), "bob row", user_id=OTHER, graph_episode_uuid=conv.uuid, graph_episode_name=conv.name)
+        _expire(w, conv.ids[0])
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert {j["memory_id"] for j in out["graph_jobs"]} == {conv.ids[1]}
+        assert w.q.meta(rid(77, 2))["graph_episode_uuid"] == conv.uuid       # untouched
+
+    def test_two_users_expiring_in_one_sweep_are_repaired_separately(self, world):
+        w = world
+        a = seed_conversation(w, n=2, tag="ca", start=1)
+        b = seed_conversation(w, n=2, tag="cb", user=OTHER, start=50)
+        _expire(w, a.ids[0], b.ids[0])
+        out = w.svc.expire_old_memories(batch_size=100)
+        assert out["per_user"] == {OWNER: 1, OTHER: 1}
+        assert {j["memory_id"] for j in out["graph_jobs"]} == {a.ids[1], b.ids[1]}
+        assert {j["user_id"] for j in out["graph_jobs"]} == {OWNER, OTHER}
+
+    def test_cron_logs_ids_unrepaired_siblings_and_repair_failure(self, world, caplog):
+        import logging
+
+        import worker
+
+        w = world
+        w.svc.expire_old_memories = MagicMock(return_value={
+            "deleted_count": 2, "per_user": {OWNER: 2}, "graph_jobs": [],
+            "graph_cascade_unresolved_ids": ["u1", "u2"],
+            "graph_sibling_unrepaired_ids": ["s1"], "graph_sibling_repair_failed": True,
+        })
+        with caplog.at_level(logging.WARNING, logger="worker"):
+            asyncio.run(worker.expire_old_memories_cron({"service": w.svc}))
+        text = caplog.text
+        assert "unresolved for 2 expired" in text and "u1" in text and "u2" in text
+        assert "1 sibling memories could not be repaired" in text and "s1" in text
+        assert "sibling lookup failed" in text
+
+    def test_cron_is_quiet_when_graph_cleanup_was_clean(self, world, caplog):
+        import logging
+
+        import worker
+
+        w = world
+        w.svc.expire_old_memories = MagicMock(return_value={
+            "deleted_count": 1, "per_user": {OWNER: 1}, "graph_jobs": [],
+            "graph_cascade_unresolved_ids": [], "graph_sibling_unrepaired_ids": [],
+            "graph_sibling_repair_failed": False,
+        })
+        with caplog.at_level(logging.WARNING, logger="worker"):
+            asyncio.run(worker.expire_old_memories_cron({"service": w.svc}))
+        assert "Expiry cron: graph cleanup" not in caplog.text and "could not be repaired" not in caplog.text

@@ -10,7 +10,7 @@
  * deliberately does NOT duplicate.
  */
 
-import { isHeartbeat, isSystemMessage, redactPrivate } from "../utils.js";
+import { findPrivateSpans, isHeartbeat, isSystemMessage, redactPrivate } from "../utils.js";
 import type { SessionNoteFields } from "./disclosure.js";
 
 export type { SessionNoteFields };
@@ -29,7 +29,8 @@ export interface ObservationRow {
 const FIELD_MAX_CHARS = 400;
 
 function squash(text: string, maxChars = FIELD_MAX_CHARS): string {
-  const clean = redactPrivate(text).replace(/\s+/g, " ").trim();
+  // The note is POSTed: fail closed (an unmatched <private> redacts to the end of the text).
+  const clean = redactPrivate(text, { failClosed: true }).replace(/\s+/g, " ").trim();
   if (clean.length <= maxChars) return clean;
   return clean.slice(0, maxChars - 1).trimEnd() + "…";
 }
@@ -103,6 +104,45 @@ export function extractLearned(turns: Array<{ user: string; assistant: string }>
 }
 
 /**
+ * Redact the pieces of ONE turn (its user text, the assistant entries before the wrap-up, the wrap-up) with the
+ * `<private>` spans decided over the whole turn: the pieces are joined, the spans found in the joined text
+ * (nesting, fail closed: an unclosed opener runs to the end, a closer with no opener redacts back to the start)
+ * and masked in place, and only then are the pieces cut out again. A span that opens in one piece and closes in
+ * a later one (the user prompt and the answer, an earlier assistant entry and the wrap-up) therefore has no tail
+ * left in the clear in any piece. A piece that is nothing but redaction comes back empty.
+ */
+export function redactTurnPieces(pieces: string[]): string[] {
+  const joined = pieces.join("\n");
+  const spans = findPrivateSpans(joined, true);
+  if (spans.length === 0) return pieces;
+  let masked = joined;
+  for (const span of spans) {
+    const fill = span.unclosed ? "\u0002" : "\u0001";
+    masked = masked.slice(0, span.start) + fill.repeat(span.end - span.start) + masked.slice(span.end);
+  }
+  const out: string[] = [];
+  let at = 0;
+  for (const piece of pieces) {
+    const part = masked
+      .slice(at, at + piece.length)
+      .replace(/\u0001+/g, "[redacted]")
+      .replace(/\u0002+/g, "[redacted:unclosed]");
+    out.push(/^\s*\[redacted(?::unclosed)?\]\s*$/.test(part) ? "" : part);
+    at += piece.length + 1;
+  }
+  return out;
+}
+
+/** A turn's wrap-up (its last assistant entry) with redaction decided over the whole turn's text. */
+export function redactedFinal(turn: { assistant: string; final?: string }): string {
+  const assistant = turn.assistant ?? "";
+  const final = turn.final;
+  if (final === undefined) return redactPrivate(assistant, { failClosed: true });
+  const earlier = assistant.endsWith(final) ? assistant.slice(0, assistant.length - final.length) : "";
+  return redactTurnPieces([earlier, final])[1];
+}
+
+/**
  * The final assistant message is usually the wrap-up — use its head.  A turn's `assistant` joins every assistant
  * entry (progress commentary first); `final`, when given, is the turn's last assistant entry on its own.
  */
@@ -110,7 +150,7 @@ export function extractCompleted(
   turns: Array<{ user: string; assistant: string; final?: string }>
 ): string | undefined {
   for (let i = turns.length - 1; i >= 0; i--) {
-    const text = (turns[i].final ?? turns[i].assistant ?? "").trim();
+    const text = redactedFinal(turns[i]).trim();
     if (!text || isSystemMessage(text)) continue;
     return squash(text, 350);
   }
@@ -154,11 +194,27 @@ export function buildSessionNote(
   observations: ObservationRow[],
 ): SessionNoteFields | null {
   const note: SessionNoteFields = {};
-  const request = extractRequest(turns);
+  // Redact every turn over its whole text (user and assistant together) before any extractor picks sentences or
+  // entries out of it: a private span can start in a sentence an extractor skips, or open in the prompt and
+  // close in the answer, so redacting what each one happens to select is not enough.
+  const clean = turns.map((t) => {
+    const assistant = t.assistant ?? "";
+    if (t.final === undefined) {
+      const [user, redAssistant] = redactTurnPieces([t.user ?? "", assistant]);
+      return { user, assistant: redAssistant, final: undefined };
+    }
+    if (assistant.endsWith(t.final)) {
+      const [user, earlier, final] = redactTurnPieces([t.user ?? "", assistant.slice(0, assistant.length - t.final.length), t.final]);
+      return { user, assistant: earlier + final, final };
+    }
+    const [user, redAssistant, final] = redactTurnPieces([t.user ?? "", assistant, t.final]);
+    return { user, assistant: redAssistant, final };
+  });
+  const request = extractRequest(clean);
   const investigated = extractInvestigated(observations);
-  const learned = extractLearned(turns);
-  const completed = extractCompleted(turns);
-  const nextSteps = extractNextSteps(turns);
+  const learned = extractLearned(clean);
+  const completed = extractCompleted(clean);
+  const nextSteps = extractNextSteps(clean);
   if (request) note.request = request;
   if (investigated) note.investigated = investigated;
   if (learned) note.learned = learned;

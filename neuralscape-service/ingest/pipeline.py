@@ -18,20 +18,49 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from adapters import require_adapter
 from ingest.chunking_strategies import get_chunking_strategy
-from ingest.extractors import get_extractor
+from ingest.extractors import DefaultExtractor, get_extractor
+from ingest.modality import MODALITY_INFERRED_LEVEL, ModalitySource, modality_upgraded  # noqa: F401 (re-exported)
 from schemas import (
     GLOBAL_CATEGORIES,
     PROJECT_CATEGORIES,
     MemoryScope,
     default_scope_for_category,
+    normalize_workspace,
 )
 
 logger = logging.getLogger(__name__)
+
+#: Caps on the failure report that leaves the process (task status, REST/MCP
+#: results). Raw exception text can carry store URLs, credentials and document
+#: content, so only a class name + a fixed per-kind message is ever returned;
+#: the raw text goes to the server log only.
+MAX_STORE_ERRORS = 5
+MAX_STORE_ERROR_CHARS = 120
+MAX_STORE_ERRORS_TOTAL_CHARS = 500
+_FIXED_MESSAGES = {
+    "passage": "passage store failed",
+    "fact": "fact store failed",
+    "concept": "concept ingest failed",
+}
+
+
+def sanitized_error(exc: BaseException, kind: str) -> str:
+    """``ClassName: <fixed message for kind>`` -- no exception text, bounded."""
+    name = re.sub(r"[^A-Za-z0-9_]", "", type(exc).__name__)[:60] or "Error"  # ASCII only
+    return f"{name}: {_FIXED_MESSAGES.get(kind, 'store failed')}"[:MAX_STORE_ERROR_CHARS]
+
+
+def _record_store_error(errors: list[str], exc: BaseException, kind: str) -> None:
+    """Append a sanitised entry, honouring the entry-count and total-length caps."""
+    entry = sanitized_error(exc, kind)
+    if len(errors) < MAX_STORE_ERRORS and sum(map(len, errors)) + len(entry) <= MAX_STORE_ERRORS_TOTAL_CHARS:
+        errors.append(entry)
 
 
 @dataclass
@@ -124,8 +153,10 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     # the caller explicitly overrode workspace. This makes the trigger case (trading books
     # poisoning the identity card) impossible by default — ingested reference content lands
     # in its own partition, fenced out of card/reflection/default recall.
-    effective_workspace = doc.workspace
-    if effective_workspace is None and adapter.name != "default":
+    # An explicit "memory" (or "") is the memory workspace: stored untagged so the dedup key
+    # matches rows written without a workspace, and it suppresses the adapter-derived default.
+    effective_workspace = normalize_workspace(doc.workspace)
+    if doc.workspace is None and adapter.name != "default":
         # Auto-derive a reference workspace name: adapter-name[--title-slug]
         base_name = f"ref-{adapter.name}"
         title_slug = None
@@ -148,6 +179,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
     base["parent_id"] = parent_id
 
     memory_ids: list[str] = []
+    # Store failures are tolerated (one bad chunk must not abort a book) but
+    # never silent: they are returned so callers can report an incomplete ingest.
+    store_errors: list[str] = []  # sanitised + capped; see _record_store_error
+    stores_failed = 0  # true count of failed store calls (store_errors is capped)
+    store_ok = 0  # successful store calls (passages + facts), for failure reports
     passage_count = 0
     fact_count = 0
     # M1 (ingest lifecycle): sum of the token cost of everything we STORE
@@ -196,11 +232,14 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     add_to_graph=False,
                 )
                 memory_ids.extend(m.id for m in stored)
+                store_ok += 1
                 passage_count += len(stored)
                 if meter_on:
                     served_tok += _served_tokens(stored)
             except Exception as e:
                 logger.warning(f"Passage store failed (chunk {chunk.index}): {e}")
+                stores_failed += 1
+                _record_store_error(store_errors, e, "passage")
 
     # ── Facts (LLM-distilled, graph-linked) ──
     # Facts are stored vector-only here (fast), with graph enrichment DEFERRED:
@@ -222,9 +261,13 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         evidence_kwargs = (
             {"category_evidence": category_evidence} if _settings.hybrid_extraction_enabled else {}
         )
+        extractor = get_extractor(adapter.extractor)
+        # Modality post-check (#444): only for the default extractor, judged on the RESOLVED
+        # extractor (an unknown name falls back to it). Built once per document.
+        modality_source = ModalitySource(doc.content) if type(extractor) is DefaultExtractor else None
         facts = service.extract_facts_only(
             doc.content,
-            extractor=get_extractor(adapter.extractor),
+            extractor=extractor,
             user_id=doc.user_id,
             project_id=doc.project_id,
             **evidence_kwargs,
@@ -245,7 +288,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                     # Distilled facts restate what the document says directly
                     # → epistemically "explicit" (A1). Verbatim passages carry
                     # no level (they're source text, not extracted claims).
-                    epistemic_level="explicit",
+                    epistemic_level=(
+                        MODALITY_INFERRED_LEVEL
+                        if modality_source is not None and modality_upgraded(content, modality_source)
+                        else "explicit"
+                    ),
                     visibility=doc.visibility,
                     sensitivity_override=doc.sensitivity_override,
                     memory_kind="fact",
@@ -258,6 +305,7 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                        if (category, content) in category_evidence else {}),
                 )
                 memory_ids.extend(m.id for m in stored)
+                store_ok += 1
                 fact_count += len(stored)
                 if meter_on:
                     served_tok += _served_tokens(stored)
@@ -273,6 +321,8 @@ def ingest_document(service, doc: IngestDoc) -> dict:
                         })
             except Exception as e:
                 logger.warning(f"Fact store failed ({category}): {e}")
+                stores_failed += 1
+                _record_store_error(store_errors, e, "fact")
 
     logger.info(
         f"Ingested doc parent_id={parent_id} → {passage_count} passages + {fact_count} facts "
@@ -300,6 +350,11 @@ def ingest_document(service, doc: IngestDoc) -> dict:
         "facts": fact_count,
         "memory_ids": memory_ids,
         "parent_id": parent_id,
+        # "ClassName: <fixed message>" per failed store call (empty = clean),
+        # capped; never carries exception text. stores_failed is the full count.
+        "store_errors": store_errors,
+        "stores_failed": stores_failed,
+        "stores_succeeded": store_ok,
         # Deferred graph-enrichment payloads + the adapter whose ontology applies.
         # Callers (the ingest worker) enqueue these onto the graph queue and then
         # drop the key from any client-facing result.

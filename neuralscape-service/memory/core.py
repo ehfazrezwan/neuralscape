@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # that persists still fails start-up after the last attempt.
 _COLD_START_ATTEMPTS = 8
 
+# How long close() waits for the Graphiti driver to close on the bridge loop.
+# Shutdown must never park for the bridge's general call limit (minutes): a
+# loop that was stopped or is wedged would block it for the whole limit.
+_CLOSE_DRIVER_TIMEOUT_S = 5.0
+
 
 def _is_collection_exists_conflict(exc: BaseException) -> bool:
     """Qdrant's 409 ``Collection `x` already exists!``: another process created it first.
@@ -62,6 +67,57 @@ def _is_concurrent_creation(exc: BaseException) -> bool:
     return _is_collection_exists_conflict(exc) or _is_collection_not_yet_readable(exc)
 
 
+# ``Settings.get_mem0_config`` sets this ``history_db_path`` when ``MEM0_HISTORY_ENABLED``
+# is off. mem0 then opens a throwaway in-memory SQLite instead of ``~/.mem0/history.db``,
+# and ``_memory_from_config`` swaps that for ``_NoHistory`` so no row is ever kept.
+_NO_HISTORY_DB_PATH = ":memory:"
+
+
+class _NoHistory:
+    """Drop-in for mem0's ``SQLiteManager`` that records nothing.
+
+    The service writes mem0's history on every memory (``m.db.add_history`` in the
+    write path, plus mem0's own ``_update_memory`` / ``_delete_memory``) but never reads
+    it, so each row was a pointless synchronous disk write. Every method of the real
+    manager the ``Memory`` / ``AsyncMemory`` code calls is here and does nothing.
+    """
+
+    connection = None
+
+    def add_history(self, *args, **kwargs) -> None:
+        return None
+
+    def batch_add_history(self, records) -> None:
+        return None
+
+    def get_history(self, memory_id):
+        return []
+
+    def save_messages(self, messages, session_scope) -> None:
+        return None
+
+    def get_last_messages(self, session_scope, limit=10):
+        return []
+
+    def reset(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _drop_history(memory) -> None:
+    """Replace ``memory.db`` (an in-memory SQLiteManager) with ``_NoHistory``."""
+    old = getattr(memory, "db", None)
+    memory.db = _NoHistory()
+    close = getattr(old, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - a throwaway in-memory database
+            logger.debug("closing the throwaway mem0 history db failed", exc_info=True)
+
+
 def _memory_from_config(memory_cls, config):
     """``Memory.from_config``, tolerating a concurrent first start.
 
@@ -76,7 +132,10 @@ def _memory_from_config(memory_cls, config):
     """
     for attempt in range(1, _COLD_START_ATTEMPTS + 1):
         try:
-            return memory_cls.from_config(config)
+            memory = memory_cls.from_config(config)
+            if isinstance(config, dict) and config.get("history_db_path") == _NO_HISTORY_DB_PATH:
+                _drop_history(memory)
+            return memory
         except Exception as exc:
             if attempt == _COLD_START_ATTEMPTS or not _is_concurrent_creation(exc):
                 raise
@@ -88,6 +147,15 @@ def _memory_from_config(memory_cls, config):
             )
             time.sleep(0.1 * attempt)
 
+_BM25_MISSING_DETAIL = (
+    "collection predates the BM25 sparse slot; keyword leg disabled (search is dense-only). "
+    "No in-place migration exists: recreate the collection and re-ingest to enable hybrid search."
+)
+# One warning per process, not per search.
+_bm25_warned = False
+_bm25_encoder_warned = False
+
+
 class CoreMixin:
     """CoreMixin for MemoryService (mechanical split — see memory_service.py)."""
 
@@ -95,8 +163,13 @@ class CoreMixin:
         self._memory = None
         self._graphiti = None
         self._bridge = None
+        # Set when the graph store was configured but its adapter failed to
+        # attach (service runs vector-only); None when graph is simply off.
+        self._graph_init_error: str | None = None
         self._genai_model = None
         self._init_lock = threading.Lock()
+        # True from a close() that released something until the next rebuild.
+        self._closed = False
 
     def _get_memory(self):
         """Lazy-initialize mem0 Memory with Graphiti backend.
@@ -115,13 +188,38 @@ class CoreMixin:
         Without this re-attach every graph write is a silent no-op and
         the health check reports ``graph_store: not_initialized``.
         """
+        if self._memory is not None and getattr(self, "_closed", False):
+            # close() released this service's clients, bridge and driver (it is the only
+            # place that sets _closed, and only when it had something to release, so
+            # everything dropped here was closed already). Never hand those closed
+            # objects to a later caller: drop them so the build below makes fresh ones.
+            with self._init_lock:
+                if self._memory is not None and getattr(self, "_closed", False):
+                    self._memory = None
+                    self._graphiti = None
+                    self._bridge = None
         if self._memory is None:
             with self._init_lock:
                 if self._memory is None:
+                    # Every Gemini client the vendored libraries build must reach the configured endpoint
+                    # (unset: unchanged), in the API, every worker queue and a stdio MCP process alike.
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
+                    # The one place `_closed` is cleared, exactly once per rebuild.
+                    self._note_reopen_if_closed(clear=True)
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
                     self._memory = _memory_from_config(Memory, config)
+                    # Capture provider usage only when a recorder is installed.
+                    from usage_capture import get_usage_recorder
+
+                    capture_usage = get_usage_recorder() is not None
+                    if capture_usage:
+                        from usage_wrappers import install_mem0_wrappers
+
+                        install_mem0_wrappers(self._memory)
 
                     # Re-attach the Graphiti adapter mem0 v2.0.2 stopped
                     # auto-creating. The MemoryGraph constructor in
@@ -158,6 +256,7 @@ class CoreMixin:
                                 provider,
                             )
                         except Exception as e:
+                            self._graph_init_error = f"{type(e).__name__}: {e}"
                             logger.warning(
                                 f"Graphiti adapter init failed (non-critical): {e}"
                             )
@@ -165,6 +264,18 @@ class CoreMixin:
                     if hasattr(self._memory, "graph") and hasattr(self._memory.graph, "graphiti"):
                         self._graphiti = self._memory.graph.graphiti
                         self._bridge = self._memory.graph._bridge
+                        if capture_usage:
+                            from usage_wrappers import install_graphiti_wrappers
+
+                            install_graphiti_wrappers(self._graphiti)
+
+                    self._ensure_indexes_at_startup()
+
+        # A startup ensure that failed (Qdrant not ready yet) is retried from
+        # here, so a write-only worker (which never searches) still recovers.
+        # Cheap no-op unless an attempt failed and the cool-down has passed.
+        if not self._filter_indexes_ok or not getattr(self, "_created_at_index_ok", False):
+            self._retry_index_ensure()
 
         return self._memory
 
@@ -235,24 +346,124 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
-                    self._genai_model = genai.Client(api_key=settings.google_api_key)
+                    # The configured endpoint (unset: unchanged) is applied to the client class, so this
+                    # client and every one the libraries build reach it.
+                    from provider_routing import apply_from_settings
+
+                    apply_from_settings(settings)
+                    # close() dropped the old client; a rebuild after it is visible
+                    # in the log. `_closed` stays set: only the memory rebuild clears it.
+                    self._note_reopen_if_closed(clear=False)
+                    self._genai_model = genai.Client(
+                        api_key=settings.google_api_key,
+                        http_options=settings.gemini_http_options(),
+                    )
         return self._genai_model
 
+    def _note_reopen_if_closed(self, *, clear: bool) -> None:
+        """Log ONE warning when a service that close() released builds clients again.
+
+        Caller holds ``_init_lock``. A late request, or a shutdown thread that was
+        abandoned by its timeout, reopening clients after shutdown must leave a trace.
+        """
+        if getattr(self, "_closed", False):
+            logger.warning(
+                "MemoryService %s was closed and is being reopened: building new clients "
+                "(a request or task ran after shutdown)",
+                id(self),
+            )
+            if clear:
+                self._closed = False
+
     def close(self):
-        """Clean up resources."""
-        if self._graphiti and self._bridge:
-            self._bridge.run(self._graphiti.close())
+        """Clean up resources: Graphiti driver, bridge loop, Qdrant and embedder clients.
+
+        Idempotent (a second call is a no-op). A later use of the service rebuilds its
+        clients (and logs a warning); the flag and the snapshot are taken under the init lock.
+        On a stopped bridge loop the driver's sockets cannot be closed: they are
+        abandoned to the OS (bounded by the process lifetime). The Qdrant and embedder client
+        closes never raise; a failure closing the Graphiti driver still
+        propagates, after everything else has been released.
+
+        Worst-case duration (a wedged bridge loop that never answers): the driver
+        close waits 5 s, then ``_AsyncBridge.shutdown`` waits up to 10 s for its
+        tasks to cancel and up to 10 s for the loop thread to stop, so about 25 s;
+        callers still blocked in the bridge are released when it returns.
+        """
+        # Flip the flag and take the clients under the same lock the lazy build uses,
+        # so a concurrent rebuild either finishes first (and its clients are the ones
+        # closed here) or starts afterwards (and builds fresh ones): none is orphaned.
+        # Nothing to release (never initialised, or already closed) leaves the flag
+        # alone, so the first real use after that is an ordinary build, not a "reopen".
+        with self._init_lock:
+            if getattr(self, "_closed", False):
+                return
+            graphiti, bridge, memory = self._graphiti, self._bridge, self._memory
+            genai_client = self._genai_model
+            if all(x is None for x in (graphiti, bridge, memory, genai_client)):
+                return
+            # The Gemini client holds nothing to release: drop it so a later use builds
+            # a new one (and logs it) like the other clients. The rest stays in place,
+            # closed, until the next _get_memory() replaces it.
+            self._genai_model = None
+            self._closed = True
+        try:
+            if graphiti and bridge:
+                try:
+                    # The bridge closes the coroutine itself when it cannot run it
+                    # (shut-down bridge) and cancels it when its loop is stopped.
+                    bridge.run(graphiti.close(), timeout=_CLOSE_DRIVER_TIMEOUT_S)
+                except TimeoutError:
+                    # A stopped or wedged bridge loop never answers; do not
+                    # wait out the general bridge limit. The loop is torn down
+                    # right below; the driver's sockets are abandoned to the OS.
+                    logger.warning(
+                        "Graphiti driver did not close within %.0fs; abandoning it",
+                        _CLOSE_DRIVER_TIMEOUT_S,
+                    )
+        finally:
+            # Stop the bridge loop AFTER the driver closed on it (even when that
+            # close raised), so no task or driver outlives its loop.
+            try:
+                shutdown = getattr(bridge, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            finally:
+                if memory is not None:  # never fall back to self._memory: it may be a rebuild
+                    self._close_http_clients(memory)
+
+    def _close_http_clients(self, memory=None) -> None:
+        """Best-effort close of the Qdrant client, the embedder's HTTP client and mem0's
+        own resources (the SQLite history connection)."""
+        if memory is None:
+            memory = self._memory
+        if memory is None:
+            return
+        closers = [
+            getattr(getattr(getattr(memory, "vector_store", None), "client", None), "close", None),
+            getattr(getattr(getattr(memory, "embedding_model", None), "client", None), "close", None),
+            getattr(memory, "close", None),  # mem0 Memory.close(): history SQLite connection
+        ]
+        for closer in closers:
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:  # noqa: BLE001 - shutdown must not raise from here
+                    logger.debug("client close failed (ignored): %s", e)
 
     def _ensure_created_at_index(self) -> None:
         """Best-effort: ensure a DATETIME payload index on ``created_at``.
 
         Qdrant's ``order_by`` scroll requires a range-capable payload index.
-        Creation is idempotent server-side; attempted once per process. On
-        failure the timeline falls back to a Python-side sort, so this never
-        raises.
+        Creation is idempotent server-side. On failure the flag stays unset and
+        the next call past the cool-down re-checks; meanwhile the timeline falls
+        back to a Python-side sort, so this never raises.
         """
         if getattr(self, "_created_at_index_ok", False):
             return
+        if time.monotonic() < getattr(self, "_created_at_retry_at", 0.0):
+            return
+        self._created_at_retry_at = time.monotonic() + self._FILTER_INDEX_RETRY_S
         try:
             from qdrant_client.models import PayloadSchemaType
 
@@ -263,46 +474,102 @@ class CoreMixin:
                 wait=True,
             )
         except Exception as e:
+            # Not marked done: re-checked after the cool-down. Warn once.
             logger.debug(f"created_at payload index ensure failed (non-fatal): {e}")
-        # Attempt once per process either way — the order_by scroll has its
-        # own fallback if the index genuinely isn't there.
+            if not getattr(self, "_created_at_warned", False):
+                self._created_at_warned = True
+                logger.warning(
+                    "qdrant_payload_index_ensure_failed fields=created_at: timeline falls back "
+                    "to a Python-side sort (will re-check in %ds)",
+                    int(self._FILTER_INDEX_RETRY_S),
+                )
+            return
         self._created_at_index_ok = True
 
     # Hot-path payload filters that deserve keyword/bool indexes (audit 27
     # #14): every pool query carries a dream_tombstoned must_not, the shared/
     # standard pools filter on visibility, and dual-scope merges filter on
     # scope — all unindexed meant full payload scans on every search.
+    #
+    # Every payload key the service filters on (grep ``FieldCondition(key=``
+    # in memory/, okf/, knowledge/, extensions/, adapters/trading/) is listed
+    # here; tests/test_qdrant_indexes_bm25_health.py scans those dirs and fails
+    # on a gap. The payload layout is mem0's: ``hash`` and ``user_id`` are top-level; everything NS stamps lives under
+    # ``metadata.*``. ``user_id`` is indexed by mem0's own store, and
+    # ``created_at`` by ``_ensure_created_at_index`` (DATETIME), so neither is
+    # repeated here. Array fields (tags, concepts) take a keyword index too.
     _FILTER_INDEX_FIELDS = (
         ("metadata.dream_tombstoned", "bool"),
         ("metadata.visibility", "keyword"),
         ("metadata.scope", "keyword"),
+        ("hash", "keyword"),
+        ("metadata.project_id", "keyword"),
+        ("metadata.category", "keyword"),
+        ("metadata.domain", "keyword"),
+        ("metadata.observation_type", "keyword"),
+        ("metadata.concepts", "keyword"),
+        ("metadata.tags", "keyword"),
+        ("metadata.memory_kind", "keyword"),
+        ("metadata.owner_user_id", "keyword"),
+        ("metadata.speaker", "keyword"),
+        ("metadata.workspace", "keyword"),
+        ("metadata.source_ref.external_id", "keyword"),
+        ("metadata.code_liveness_stale", "bool"),
         # Shared-episode sibling lookup (memory/provenance.py) and
         # graph-contradiction supersession (memory/supersession.py, edge
         # episode -> row): both scroll on these; unindexed they scan the
         # collection each time.
         ("metadata.graph_episode_uuid", "keyword"),
         ("metadata.graph_episode_name", "keyword"),
+        # Edit compare-and-set (memory/edit.py): every edit's conditional write
+        # filters on the row's revision and token, and the repair crons scroll
+        # on the pending markers. These are top-level payload keys (not under
+        # ``metadata``); ``metadata.revision`` is the legacy mirror the same
+        # filter falls back to for rows written before the top-level revision.
+        ("ns_revision", "integer"),
+        ("ns_token", "keyword"),
+        ("ns_text_revision", "integer"),
+        ("ns_meta_pending", "bool"),
+        ("ns_meta_pending_at", "float"),
+        ("ns_meta_repair_attempts", "integer"),
+        ("vector_pending", "bool"),
+        ("vector_pending_at", "float"),
+        ("vector_revision", "integer"),
+        ("vector_repair_attempts", "integer"),
+        ("metadata.revision", "integer"),
     )
 
-    def _ensure_filter_indexes(self) -> None:
-        """Best-effort: ensure payload indexes on the hot-path filter fields.
+    # After a failed attempt, do not retry on every search against a flaky
+    # Qdrant; allow a re-check after this many seconds.
+    _FILTER_INDEX_RETRY_S = 60.0
+    _filter_indexes_ok = False
+    _created_at_index_ok = False
 
-        Same pattern as ``_ensure_created_at_index``: idempotent server-side,
-        attempted once per service instance, ``wait=False`` so index builds
-        never block the first read, and any failure degrades to Qdrant's
-        unindexed filtering rather than raising.
+    def _ensure_filter_indexes(self) -> None:
+        """Best-effort: ensure payload indexes on the filter fields.
+
+        Idempotent server-side, ``wait=False`` so index builds never block a
+        read, and any failure degrades to Qdrant's unindexed filtering rather
+        than raising. The done flag is set only when every field succeeded;
+        after a failure the next call past ``_FILTER_INDEX_RETRY_S`` re-checks,
+        and the failed field names are logged at warning (once per instance).
         """
         if getattr(self, "_filter_indexes_ok", False):
             return
-        # Mark attempted FIRST — a flaky Qdrant must not re-pay this on
-        # every subsequent search.
-        self._filter_indexes_ok = True
+        if time.monotonic() < getattr(self, "_filter_index_retry_at", 0.0):
+            return
+        # Surface a pre-v3 collection (no BM25 slot) once per process.
+        self._warn_bm25_missing_once()
+        self._filter_index_retry_at = time.monotonic() + self._FILTER_INDEX_RETRY_S
+        failed: list[str] = []
         try:
             from qdrant_client.models import PayloadSchemaType
 
             schema_by_name = {
                 "bool": PayloadSchemaType.BOOL,
                 "keyword": PayloadSchemaType.KEYWORD,
+                "integer": PayloadSchemaType.INTEGER,
+                "float": PayloadSchemaType.FLOAT,
             }
             client = self._get_memory().vector_store.client
             for field_name, schema_name in self._FILTER_INDEX_FIELDS:
@@ -314,8 +581,118 @@ class CoreMixin:
                         wait=False,
                     )
                 except Exception as e:
-                    logger.debug(
-                        f"payload index ensure failed for {field_name} (non-fatal): {e}"
-                    )
+                    failed.append(field_name)
+                    logger.debug(f"payload index ensure failed for {field_name}: {e}")
         except Exception as e:
-            logger.debug(f"filter payload index ensure failed (non-fatal): {e}")
+            failed.append("*")
+            logger.debug(f"filter payload index ensure failed: {e}")
+        if not failed:
+            self._filter_indexes_ok = True
+        elif not getattr(self, "_filter_index_warned", False):
+            self._filter_index_warned = True
+            logger.warning(
+                "qdrant_payload_index_ensure_failed fields=%s: filters on these run unindexed "
+                "(will re-check in %ds)",
+                ",".join(failed),
+                int(self._FILTER_INDEX_RETRY_S),
+            )
+
+    def _retry_index_ensure(self) -> None:
+        """Re-run the background ensure after a failed attempt, once per cool-down."""
+        now = time.monotonic()
+        pending = []  # retry-at times of the ensures that have not succeeded
+        if not self._filter_indexes_ok:
+            pending.append(getattr(self, "_filter_index_retry_at", 0.0))
+        if not getattr(self, "_created_at_index_ok", False):
+            pending.append(getattr(self, "_created_at_retry_at", 0.0))
+        # 0.0 = never attempted (init in progress): leave it to the startup hook.
+        if not pending or any(t == 0.0 for t in pending) or now < min(pending):
+            return
+        thread = getattr(self, "_index_ensure_thread", None)
+        if thread is not None and thread.is_alive():
+            return
+        self._ensure_indexes_at_startup()
+
+    def _ensure_indexes_at_startup(self) -> None:
+        """Ensure all payload indexes once memory is initialised, off the caller.
+
+        Runs on a daemon thread so neither the event loop nor a cold-start
+        request waits on Qdrant; never raises. Workers get the indexes before
+        their first dedup probe, not on their first search.
+        """
+
+        def _run():
+            try:
+                self._ensure_filter_indexes()
+                self._ensure_created_at_index()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"startup payload index ensure failed (non-fatal): {e}")
+            # Graphiti's Neo4j indices/constraints: otherwise built lazily on
+            # the first graph add/search, so a fresh database serves its first
+            # queries (and the label-scoped patch Cypher) without them.
+            # Idempotent; best-effort.
+            try:
+                ensure_graph = getattr(getattr(self._memory, "graph", None), "_ensure_indices", None)
+                if callable(ensure_graph):
+                    ensure_graph()
+            except Exception as e:  # noqa: BLE001
+                logger.debug(f"startup graph index ensure failed (non-fatal): {e}")
+
+        thread = threading.Thread(target=_run, name="qdrant-index-ensure", daemon=True)
+        self._index_ensure_thread = thread
+        thread.start()
+
+    def vector_store_capabilities(self) -> dict:
+        """What the live vector store can do, for ``/health`` (public fields only).
+
+        ``bm25_sparse``: the collection has the BM25 sparse slot (``False`` =
+        predates v3, search is dense-only). ``bm25_encoder``: ``loaded`` /
+        ``unavailable`` (fastembed missing or failed to load: dense-only even
+        with the slot) / ``not_loaded`` (lazy, not used yet). ``None`` values
+        mean not initialised or not reported. Free-text detail goes to the
+        server log, not to this unauthenticated payload. Never initialises
+        the store and never raises.
+        """
+        memory = self._memory
+        store = getattr(memory, "vector_store", None) if memory is not None else None
+        flag = getattr(store, "_has_bm25_slot", None) if store is not None else None
+        if not isinstance(flag, bool):
+            return {"bm25_sparse": None, "bm25_encoder": None}
+        encoder = getattr(store, "_bm25_encoder", None)
+        if encoder is False:
+            state = "unavailable"
+        elif encoder is None:
+            state = "not_loaded"
+        else:
+            state = "loaded"
+        if not flag:
+            self._warn_bm25_missing_once()
+        elif state == "unavailable":
+            self._warn_bm25_encoder_once()
+        return {"bm25_sparse": flag, "bm25_encoder": state}
+
+    def _warn_bm25_encoder_once(self) -> None:
+        global _bm25_encoder_warned
+        if _bm25_encoder_warned:
+            return
+        _bm25_encoder_warned = True
+        logger.warning(
+            "vector_store_bm25_encoder_unavailable collection=%s: the BM25 encoder (fastembed) "
+            "failed to load, so the keyword leg is off and search is dense-only.",
+            settings.qdrant_collection,
+        )
+
+    def _warn_bm25_missing_once(self) -> None:
+        """One structured warning per process when the BM25 slot is missing."""
+        global _bm25_warned
+        if _bm25_warned:
+            return
+        store = getattr(self._memory, "vector_store", None) if self._memory is not None else None
+        if getattr(store, "_has_bm25_slot", None) is not False:
+            return
+        _bm25_warned = True
+        logger.warning(
+            "vector_store_bm25_slot_missing collection=%s: keyword leg disabled, search is dense-only. %s",
+            settings.qdrant_collection,
+            _BM25_MISSING_DETAIL,
+        )

@@ -86,7 +86,7 @@ uv run pytest tests/test_async_pipeline.py -v -s
 
 ## Claude Code / Cowork Plugin
 
-The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifecycle hooks plus ten user-facing slash commands (including `/neuralscape:ingest` for files/folders/pasted context; plus an internal `compile-observations` helper the hooks/`capture` invoke) plus the ten Neuralscape MCP tools auto-wired on install.
+The **neuralscape plugin** gives Claude Code automatic, persistent memory: seven lifecycle hook events plus eleven user-facing slash commands (including `/neuralscape:ingest` for files/folders/pasted context and `/neuralscape:process` for team processes; plus an internal `compile-observations` helper the hooks/`capture` invoke) plus the Neuralscape MCP server's tools (26 core, plus 7 code-graph tools when the server has the optional `code-graph` extra) auto-wired on install.
 
 > **Claude Cowork:** Cowork does **not** run plugin hooks ([#27398](https://github.com/anthropics/claude-code/issues/27398)), so the automatic inject/capture loop below does not fire there. Cowork is supported via a remote **MCP OAuth connector** plus a standing-context "memory protocol" that drives recall/capture through the MCP tools. See **[COWORK.md](./COWORK.md)** — that is the supported Cowork path, not this hook-based one.
 
@@ -95,7 +95,9 @@ The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifec
 ```
 [Claude Code or Cowork]
     ↓ SessionStart hook (sync — pulls context from /v1/context/, injects as additionalContext)
+    ↓ PreToolUse / PostToolUse / UserPromptSubmit / PreCompact hooks (read gate, observation capture, compile trigger, compact snapshot)
     ↓ Stop hook        (async — flushes new turns, commits offset, triggers compile)
+    ↓ SessionEnd hook  (async — end marker + one structured session note)
 [neuralscape-plugin/]  ← TypeScript plugin (auto-detects Claude Code / Cowork / OpenClaw / generic)
     ↓ HTTP calls
 [neuralscape-service/] ← Python service (extraction, storage, graph, vault dual-write)
@@ -104,7 +106,12 @@ The **neuralscape plugin** gives Claude Code automatic, persistent memory: lifec
 | Hook | When | What it does | Blocking? |
 |------|------|--------------|-----------|
 | **SessionStart** | Session start / resume / clear | Calls `/v1/context/{projectId}` (or `/v1/context/global`), formats the response by category, injects as `additionalContext` | Yes (sync, ~1s, 30s timeout) |
-| **Stop** | Session ends | Reads transcript since last offset, POSTs each new turn to `/flush`, commits offset only after success, then triggers `/compile` | No (async, 60s timeout) |
+| **PreToolUse** (Read) | Before a file Read | File Read Gate: injects a ranked per-file memory timeline alongside the read when the file is large and has memories (the read always proceeds) | Yes (sync, 5s timeout) |
+| **PostToolUse** | After each tool call | Appends one row per significant tool call to a local per-session observation buffer (no network, no LLM) | No (async) |
+| **UserPromptSubmit** | Each user prompt | When the buffer crosses the threshold, asks Claude to compile it via the `compile-observations` skill | Yes (sync, local check, 10s timeout) |
+| **PreCompact** | Before compaction | Stores one compact-snapshot memory (plus a local copy) that the post-compact SessionStart re-injects | No (async) |
+| **Stop** | After each assistant turn | Reads transcript since last offset, POSTs each new turn to `/flush`, commits offset only after success, then triggers `/compile` | No (async, 60s timeout) |
+| **SessionEnd** | Session ends (clear/logout/exit) | Writes the `.ended` buffer marker, then stores one structured session note via `/v1/checkpoint` | No (async, 30s timeout) |
 
 Slash commands (auto-discovered from `skills/`). The MCP-driven ones work in
 both Claude Code and Claude Cowork:
@@ -117,6 +124,7 @@ both Claude Code and Claude Cowork:
 | `/neuralscape:project` | List / pick / create the project to scope memory to | Both (MCP) |
 | `/neuralscape:search` | Inline memory recall (`recall_memories`; `/v1/search` as CLI fast path) | Both (MCP) |
 | `/neuralscape:ingest` | Ingest files/folders/zips or pasted context (Markdown/HTML/PDF/MS-Office) | Both (MCP) |
+| `/neuralscape:process` | Start a defined team process and pull its authoritative standards | Both (MCP) |
 | `/neuralscape:ns-status` | Reachability check + config display | Both (degrades) |
 | `/neuralscape:ns-config` | Show URL / user_id / API-key state (or connector mode) without leaking secrets | Both (degrades) |
 | `/neuralscape:sync` | Manually flush the current conversation (delegates to `save-session` in Cowork) | Both |
@@ -182,7 +190,7 @@ untouched `.env` will therefore stop at startup with
 
 ## MCP Server
 
-10 tools exposed via MCP for direct use by AI agents:
+The MCP server exposes 26 core tools (plus 7 code-graph tools when the optional `code-graph` extra is installed; call `tools/list` for the live set). The most-used tools for direct use by AI agents:
 
 | Tool | Mode | Purpose |
 |---|---|---|
@@ -303,7 +311,7 @@ There are two approaches to giving Claude Code persistent memory. Use either or 
 
 The neuralscape plugin handles context injection and conversation capture automatically via lifecycle hooks. See the [Claude Code / Cowork Plugin](#claude-code--cowork-plugin) section above for installation.
 
-Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the ten Neuralscape MCP tools, so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
+Once installed, the plugin loads on every session across all projects. The plugin's `.mcp.json` also auto-wires the Neuralscape MCP tools (26 core, plus 7 code-graph tools when the optional extra is installed), so the manual MCP setup below is redundant if you've installed the plugin. The MCP-only path remains documented for setups that can't run a plugin.
 
 ### Approach 2: MCP server + CLAUDE.md instructions
 
@@ -454,7 +462,7 @@ curl "http://localhost:8199/v1/graph/communities?user_id=ehfaz"
        │  ┌──────────────────────────────────────────────┐
        │  │           neuralscape-service                │
        │  │                                              │
-       ├─►│  MCP Server (8 tools)   REST API (/v1)      │
+       ├─►│  MCP Server (26+ tools)  REST API (/v1)      │
        │  │       stdio / HTTP         FastAPI           │
        │  │              │                │              │
        │  │              └──────┬─────────┘              │
@@ -604,7 +612,7 @@ All settings are environment variables (loaded from `.env`):
 | `ARQ_JOB_TIMEOUT` | `300` | Max seconds per background task (5 min) |
 | `DEDUP_SIMILARITY_THRESHOLD` | `0.95` | Cosine similarity threshold for semantic dedup |
 | `DEDUP_BATCH_SIZE` | `100` | Qdrant scroll page size during dedup |
-| `DEDUP_CRON_HOURS` | `{0,6,12,18}` | Hours (UTC) when the dedup cron runs |
+| `DEDUP_CRON_HOURS` | `0,6,12,18` | Hours (UTC) when the dedup cron runs: comma list or JSON list; blank = default; `[]` disables it |
 
 ## Tests
 
@@ -642,7 +650,7 @@ neuralscape/
 │   │   └── plugin.json           # Manifest with userConfig prompts
 │   ├── .mcp.json                 # Remote HTTP MCP at <URL>/mcp/
 │   ├── hooks/
-│   │   ├── hooks.json            # Claude Code: SessionStart, Stop
+│   │   ├── hooks.json            # Claude Code: SessionStart, PreToolUse, PostToolUse, UserPromptSubmit, PreCompact, Stop, SessionEnd
 │   │   └── openclaw-hooks.json   # OpenClaw: message:sent, session:end
 │   ├── skills/                   # Slash command skills (status, search, sync, config)
 │   ├── src/

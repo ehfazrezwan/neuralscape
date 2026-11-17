@@ -22,12 +22,13 @@ so recovery from that live 500 remains unproven.
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import httpx
 import pytest
 
-from nsaccept import eventually, expect_check_fails, needs, negative_control, proves
+from nsaccept import eventually, expect_check_fails, guard, needs, negative_control, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import Written, memory_ids_in, rows_with, list_rows
 from nsaccept.runctx import container_restart_count, parse_ps_json
@@ -218,14 +219,15 @@ def check_stack_stable(rows: list[dict], restarts: dict[str, int], services: lis
 @needs("compose")
 def test_api_and_workers_started_together_on_empty_collections_stay_up(ctx, a, restore_stack):
     """DESTRUCTIVE: wipes the vector store. Runs only with NS_ALLOW_DESTRUCTIVE=1 and a
-    compose project named nscampaign*.
+    compose project that passes the disposable-prefix allowlist (guard.py).
 
     Stop the API and the three workers, delete both Qdrant collections, start all
     four at once (they race to create the collections), then require: all running,
     zero exits and restarts after 90 s, and a write that works and is recalled.
     Three cycles."""
-    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1" or not (ctx.compose_project or "").startswith("nscampaign"):
-        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1 and a compose project named nscampaign*")
+    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1" or not ctx.compose_project:
+        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1 and a compose project")
+    guard.check_compose_project(ctx.compose_project)  # refuses anything outside the allowlist
     for cycle in range(1, COLD_CYCLES + 1):
         ctx.compose("stop", *APP_SERVICES)
         for name in COLLECTIONS:
@@ -261,3 +263,58 @@ def test_stability_check_fails_for_a_restarting_or_exited_service():
     expect_check_fails(check_stack_stable, ok, {"api": 1}, ["api"])
     expect_check_fails(check_stack_stable, [{"Service": "api", "State": "exited", "ExitCode": 1}], {}, ["api"])
     expect_check_fails(check_stack_stable, [], {}, ["api"])
+
+
+# ── Neo4j outage: graph search must say "degraded", not "no facts" ─
+
+
+NEO4J = os.environ.get("NS_NEO4J_SERVICE", "neo4j")
+
+
+def check_graph_search_degraded(client: NSClient, project_id: str, *, want: bool) -> dict:
+    resp = client.post("/v1/graph/search", json={"query": "anything at all", "project_id": project_id, "limit": 3})
+    assert resp.status_code == 200, f"POST /v1/graph/search -> {resp.status_code}: {resp.text[:160]}"
+    body = resp.json()
+    if want:
+        assert body.get("degraded") is True and body.get("error") == "graph_unavailable", f"outage read as success: {body}"
+        assert body.get("status") == "degraded", body
+    else:
+        assert "degraded" not in body and body.get("status") == "ok", f"healthy graph marked degraded: {body}"
+    return body
+
+
+@proves("read.search-knowledge-graph")
+@needs("compose")
+def test_graph_search_reports_degraded_while_neo4j_is_paused(ctx, a, restore_stack):
+    """DESTRUCTIVE (pauses Neo4j): needs NS_ALLOW_DESTRUCTIVE=1 and a disposable compose project."""
+    try:
+        guard.check_compose_project(ctx.compose_project or "")
+    except guard.GuardError:
+        pytest.skip("destructive: needs a disposable compose project on the allowlist")
+    if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1":
+        pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1")
+    check_graph_search_degraded(a, ctx.project_id, want=False)
+    ctx.compose("pause", NEO4J)
+    try:
+        check_graph_search_degraded(a, ctx.project_id, want=True)  # waits out the bridge timeout (~30 s)
+    finally:
+        # Restore loudly, without masking a failure already propagating.
+        restore_error = None
+        try:
+            ctx.compose("unpause", NEO4J)
+            rows = parse_ps_json(ctx.compose("ps", "--all", "--format", "json", NEO4J).stdout or "")
+            states = {r.get("State") for r in rows}
+            assert states == {"running"}, f"neo4j not running after unpause: {states or 'no container'}"
+        except Exception as exc:  # noqa: BLE001
+            restore_error = exc
+        if restore_error is not None and sys.exc_info()[0] is None:
+            raise restore_error
+        if restore_error is not None:
+            print(f"WARNING: neo4j restore failed while the scenario was already failing: {restore_error!r}")
+    eventually(lambda: check_graph_search_degraded(a, ctx.project_id, want=False), timeout=120, what="graph search healthy again")
+
+
+@proves("read.search-knowledge-graph")
+@negative_control
+def test_degraded_check_fails_for_a_healthy_graph(ctx, a):
+    expect_check_fails(check_graph_search_degraded, a, ctx.project_id, want=True)

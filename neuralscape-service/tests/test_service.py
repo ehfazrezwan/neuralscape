@@ -184,7 +184,7 @@ class TestDeleteMemoriesEndpoint:
         data = resp.json()
         assert data["status"] == "ok"
         assert "deleted" in data["message"].lower()
-        mock_service.delete_memories.assert_called_once_with(user_id="u1")
+        mock_service.delete_memories.assert_called_once_with(user_id="u1", include_shared=False)
 
 
 # ──────────────────────────────────────────────
@@ -611,6 +611,49 @@ class TestV1PatchMemory:
         resp = client.patch("/v1/memories/m1", json={"project_id": None})
         assert resp.status_code == 200
         assert mock_service.patch_memory.call_args.args[2] == {"project_id": None}
+
+    def test_patch_without_expected_revision_calls_the_service_as_before(self, client, mock_service):
+        mock_service.patch_memory.return_value = _patch_result()
+        resp = client.patch("/v1/memories/m1", json={"tags": ["x"]})
+        assert resp.status_code == 200
+        assert mock_service.patch_memory.call_args.kwargs == {}
+        assert "expected_revision" not in mock_service.patch_memory.call_args.args[2]
+
+    def test_patch_forwards_expected_revision_and_keeps_it_out_of_the_changes(self, client, mock_service):
+        mock_service.patch_memory.return_value = _patch_result()
+        resp = client.patch("/v1/memories/m1", json={"tags": ["x"], "expected_revision": "4"})
+        assert resp.status_code == 200
+        call = mock_service.patch_memory.call_args
+        assert call.kwargs == {"expected_revision": "4"}
+        assert call.args[2] == {"tags": ["x"]}
+
+    def test_stale_revision_maps_to_409_with_the_current_revision(self, client, mock_service):
+        from memory.edit import RevisionConflict
+
+        mock_service.patch_memory.side_effect = RevisionConflict("m1", "3", "5")
+        resp = client.patch("/v1/memories/m1", json={"tags": ["x"], "expected_revision": "3"})
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        assert detail["error"] == "revision_conflict"
+        assert (detail["expected_revision"], detail["current_revision"]) == ("3", "5")
+
+    def test_expected_revision_alone_is_still_an_empty_patch(self, client, mock_service):
+        resp = client.patch("/v1/memories/m1", json={"expected_revision": "1"})
+        assert resp.status_code == 400
+        mock_service.patch_memory.assert_not_called()
+
+    def test_malformed_expected_revision_maps_to_400(self, client, mock_service):
+        mock_service.patch_memory.side_effect = ValueError("expected_revision must be a revision token")
+        resp = client.patch("/v1/memories/m1", json={"tags": ["x"], "expected_revision": "abc"})
+        assert resp.status_code == 400
+
+    def test_a_read_returns_the_revision_to_echo(self, client, mock_service):
+        from schemas import MemoryResponse
+
+        mock_service.get_memory.return_value = MemoryResponse(id="m1", memory="x", revision="2")
+        resp = client.get("/v1/memories/m1")
+        assert resp.status_code == 200
+        assert resp.json()["revision"] == "2"
 
     def test_patch_empty_body_400(self, client, mock_service):
         resp = client.patch("/v1/memories/m1", json={})

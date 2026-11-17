@@ -15,6 +15,7 @@ above the seam branches on transport — this is a first-class KnowledgeSystem.
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 
@@ -297,6 +298,11 @@ class GraphifyLibEngine:
 
         # Collect files to extract
         files = collect_files(source_path, follow_symlinks=False, root=source_path)
+        real_root = os.path.realpath(source_path)
+        files = [
+            f for f in files
+            if os.path.realpath(f) == real_root or os.path.realpath(f).startswith(real_root + os.sep)
+        ]
         if not files:
             logger.warning("No files found in source: %s", source)
             self.G = nx.Graph()

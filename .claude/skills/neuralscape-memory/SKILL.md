@@ -21,6 +21,7 @@ Every memory carries a `visibility` and an `owner_user_id`:
 
 - **`private`** — only the writing user can read it. Personal preferences, identity facts, in-progress task context.
 - **`shared`** — every authenticated user in this Neuralscape instance can read it. Team knowledge: tech stack, conventions, architecture decisions.
+- **`standard`** — an authoritative pool readable by everyone but writable only by a designated dictator (`DICTATOR_USER_IDS`), gated behind `STANDARDS_ENABLED`. It is never a per-category default; only write it when explicitly asked and permitted (a non-dictator or disabled-tier write is rejected).
 
 **Per-category defaults** (you almost never need to override):
 
@@ -29,7 +30,7 @@ Every memory carries a `visibility` and an `owner_user_id`:
 | `private` | `preference`, `personal_fact`, `technical_skill`, `domain_knowledge`, `task_context` |
 | `shared` | `tech_stack`, `convention`, `architecture`, `dependency`, `decision`, `interaction`, `workflow`, `procedure` |
 
-The default does the right thing ~80% of the time. Override `visibility` only when:
+Categories outside this table (registered by a knowledge adapter) default to `private`. The default does the right thing ~80% of the time. Override `visibility` only when:
 - A `preference` is actually a team norm worth sharing (rare) → `shared`
 - A team `decision` is sensitive WIP nobody else should see yet → `private`
 - A `task_context` you want a teammate to pick up → `shared`
@@ -42,9 +43,15 @@ The default does the right thing ~80% of the time. Override `visibility` only wh
 
 **When a per-user HMAC bearer token is provided** in `Authorization: Bearer …`, the server reads `user_id` from the token's verified payload. If you also pass `user_id` in the request body and it disagrees with the token, the server returns 400. Always pass the same `user_id` you've been told to use.
 
-**When no bearer token is provided** (or the legacy shared-API-key path is in use), the server falls back to reading `user_id` from the request body — same as the pre-multi-user behavior. The plugin's `.mcp.json` always sends the configured `API_KEY` as a bearer token, so MCP callers almost always hit the token path; only direct REST callers without `Authorization` end up on the body-fallback path.
+**When no bearer token is provided** (or the legacy shared-API-key path is in use), the server falls back to reading `user_id` from the request body — same as the pre-multi-user behavior. MCP callers through the plugin's bundled connector authenticate with an OAuth token (the server reads the identity from it and ignores a claimed `user_id`); stdio and direct REST callers without `Authorization` end up on the body-fallback path.
 
-The plugin (when installed in Claude Code) handles auth transparently — your MCP tool calls just include `user_id` and the plugin's `.mcp.json` forwards the bearer token from the user's configured `API_KEY`.
+**Auth is fail-closed.** If the server has neither `NEURALSCAPE_USER_TOKEN_SECRET` nor `NEURALSCAPE_API_KEY` configured it refuses to start (and answers 503 `Authentication is not configured` on protected paths) unless the operator explicitly sets `NEURALSCAPE_AUTH_DISABLED=true` for a trusted local machine. With auth disabled and no `user_id` supplied, the server uses its configured default user.
+
+The plugin (when installed in Claude Code) handles auth transparently; your MCP tool calls just include `user_id`.
+
+## What the plugin hooks do for you (Claude Code)
+
+The plugin registers seven hook events (`hooks/hooks.json`), so much of the loop below is automatic: `SessionStart` injects a memory index and last-session note; `PreToolUse` (Read) adds a per-file memory timeline for large files; `PostToolUse` records tool observations to a local buffer; `UserPromptSubmit` asks you to compile that buffer (the `compile-observations` skill) once it is big or old enough; `PreCompact` stores a compact snapshot that is re-injected after compaction; `Stop` flushes conversation turns; `SessionEnd` stores one structured session note. Cowork runs no plugin hooks, so there you drive recall and save yourself with the tools below.
 
 ## When to Use Memory
 
@@ -60,6 +67,8 @@ Always pass:
 - `project_id` — the current project slug when working in a project context. Project-scoped categories (`tech_stack`, `convention`, `architecture`, `dependency`) **require** this.
 
 ## MCP Tools
+
+The server exposes 26 core tools (plus 7 code-graph tools when its optional `code-graph` extra is installed; run `tools/list` for the live set). The seven below are the everyday ones; others cover `get_memories`, `timeline`, `edit_memory`, `retag_memories`, `checkpoint`, `ask_memory`, `ingest_text`/`ingest_document`, `list_projects`, `list_processes`/`get_process`, `queue_status` and more.
 
 ### 1. `recall_memories` - Search memories (sync)
 
@@ -259,6 +268,8 @@ The service runs at `http://localhost:8199`. All v1 endpoints accept `user_id` (
 | Store via LLM extraction | `POST` | `/v1/memories` | 202 `{task_id, poll_url}` |
 | Store single fact | `POST` | `/v1/memories/raw` | 202 `{task_id, poll_url}` |
 | Poll task status | `GET` | `/v1/memories/status/{task_id}` | `{status, result, error}` |
+| Store a session note | `POST` | `/v1/checkpoint` | 202 |
+| Ingest text / files | `POST` | `/v1/ingest/text`, `/v1/ingest/files` | 202 |
 
 **Read endpoints return 200 with results immediately:**
 
@@ -270,10 +281,14 @@ The service runs at `http://localhost:8199`. All v1 endpoints accept `user_id` (
 | Global context only | `GET` | `/v1/context/global?user_id=...` |
 | List memories | `GET` | `/v1/memories?user_id=...&scope=...&category=...` |
 | Get single memory | `GET` | `/v1/memories/{id}` |
-| Update memory | `PUT` | `/v1/memories/{id}` |
+| Update memory | `PATCH` | `/v1/memories/{id}` (`PUT` is a transitional alias) |
 | Delete memory | `DELETE` | `/v1/memories/{id}` |
 | Bulk delete | `DELETE` | `/v1/memories` (body: `{user_id, scope?, category?, project_id?, filter_null_category?, include_shared?}` — default removes private writes only; `include_shared: true` also removes the caller's shared writes) |
 | List categories | `GET` | `/v1/categories` |
+| Batch get by id | `POST` | `/v1/memories/batch-get` |
+| Timeline around a memory | `POST` | `/v1/timeline` |
+| List projects | `GET` | `/v1/projects` |
+| Queue status | `GET` | `/v1/queue/status` |
 | Graph nodes | `GET` | `/v1/graph/nodes?user_id=...&project_id=...` |
 | Graph edges | `GET` | `/v1/graph/edges?user_id=...&project_id=...` |
 | Graph episodes | `GET` | `/v1/graph/episodes?user_id=...` |

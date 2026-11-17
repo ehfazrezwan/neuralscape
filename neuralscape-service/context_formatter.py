@@ -100,12 +100,16 @@ def format_context_for_injection(
     sections: list[str] = []
     total_chars = 0
 
-    for cat in CATEGORY_ORDER:
+    # Core categories first in display order, then any other category the
+    # caller has memories in (registered by a knowledge adapter), sorted by
+    # name so the output is stable.
+    extras = sorted(c for c in categories if c not in CATEGORY_ORDER)
+    for cat in [*CATEGORY_ORDER, *extras]:
         memories = categories.get(cat)
         if not memories:
             continue
 
-        label = CATEGORY_LABELS.get(cat, cat)
+        label = CATEGORY_LABELS.get(cat) or cat.replace("_", " ").title()
         lines: list[str] = [f"## {label}"]
 
         for mem in memories:

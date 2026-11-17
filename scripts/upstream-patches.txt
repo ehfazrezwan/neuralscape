@@ -21,11 +21,16 @@
 
 # --- graphiti (patched) ---
 patched graphiti/graphiti_core/cross_encoder/gemini_reranker_client.py
+patched graphiti/graphiti_core/driver/neo4j/operations/search_ops.py
 patched graphiti/graphiti_core/driver/neo4j_driver.py
 patched graphiti/graphiti_core/embedder/gemini.py
+patched graphiti/graphiti_core/graphiti.py
 patched graphiti/graphiti_core/llm_client/config.py
 patched graphiti/graphiti_core/llm_client/gemini_client.py
+patched graphiti/graphiti_core/search/search.py
+patched graphiti/graphiti_core/search/search_utils.py
 patched graphiti/graphiti_core/utils/maintenance/edge_operations.py
+patched graphiti/graphiti_core/utils/maintenance/graph_data_operations.py
 patched graphiti/graphiti_core/utils/maintenance/node_operations.py
 
 # --- graphiti (owned: NS-only, not upstream) ---
@@ -33,11 +38,16 @@ owned graphiti/graphiti_core/llm_client/hybrid_decision_client.py
 
 # --- mem0 (patched) ---
 patched mem0/mem0/configs/embeddings/base.py
+patched mem0/mem0/configs/llms/base.py
+patched mem0/mem0/configs/vector_stores/qdrant.py
+patched mem0/mem0/embeddings/gemini.py
 patched mem0/mem0/embeddings/openai.py
+patched mem0/mem0/llms/gemini.py
 patched mem0/mem0/graphs/configs.py
 patched mem0/mem0/memory/main.py
 patched mem0/mem0/memory/graphiti_memory.py
 patched mem0/mem0/utils/factory.py
+patched mem0/mem0/vector_stores/qdrant.py
 
 # --- mem0 (owned: restored graph layer / Graphiti adapter) ---
 owned mem0/mem0/graphs/__init__.py

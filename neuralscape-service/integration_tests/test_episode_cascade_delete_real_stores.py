@@ -12,9 +12,10 @@ extracted facts). Then:
 3. a bulk private delete of the user leaves zero rows and zero live edges in
    the user's group.
 
-Invoked explicitly (outside ``tests/``). A missing or unreachable service is a
-test FAILURE, never a skip. Required env: NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
-QDRANT_URL, GOOGLE_API_KEY (the LLM).
+Uses the integration fixtures (``stores``, ``llm_key``, ``flags``, ``unique_ns``):
+the rows live in a throwaway Qdrant collection dropped afterwards, the user's
+graph group is purged by ``unique_ns.on_cleanup``. On the gate
+(``NS_INTEGRATION_REQUIRED=1``) missing stores or key fail the test.
 """
 
 from __future__ import annotations
@@ -22,39 +23,40 @@ from __future__ import annotations
 import third_party_telemetry  # noqa: F401  (telemetry guard; must precede mem0/graphiti imports)
 
 import asyncio
-import os
 import time
-import uuid
 
 import pytest
 
-pytestmark = pytest.mark.integration
-
-REQUIRED_ENV = ("NEO4J_URI", "NEO4J_USER", "NEO4J_PASSWORD", "QDRANT_URL", "GOOGLE_API_KEY")
+from integration_tests.cascade_markers import VICTIM_MARKER, conversation, select_victims
 
 
-@pytest.fixture(scope="module")
-def svc():
-    missing = [k for k in REQUIRED_ENV if not os.environ.get(k)]
-    assert not missing, f"integration environment incomplete, missing: {missing}"
+@pytest.fixture
+def svc(flags, stores, llm_key, unique_ns):
+    from qdrant_client import QdrantClient
+
+    flags(qdrant_collection=unique_ns.qdrant_collection, qdrant_url=stores.qdrant_url)
+    unique_ns.on_cleanup(
+        lambda: QdrantClient(url=stores.qdrant_url).delete_collection(unique_ns.qdrant_collection)
+    )
     from memory_service import MemoryService
 
     service = MemoryService()
     service._get_memory()  # real mem0 + Graphiti; raises if a store is unreachable
     assert service._graphiti is not None and service._bridge is not None, "graph store not initialised"
-    yield service
+    return service
 
 
 @pytest.fixture
-def user(svc):
-    uid = f"it-epcascade-{uuid.uuid4().hex[:12]}"
-    yield uid
-    # Always clean up: vectors + every graph node/edge in the user's groups.
-    try:
-        svc.delete_memories(user_id=uid, include_shared=True)
-    finally:
+def user(svc, unique_ns):
+    uid = unique_ns.user_id
+
+    def _purge():
+        # vectors are dropped with the collection; remove every graph node/edge in the user's group
         _cypher(svc, "MATCH (n {group_id: $g}) DETACH DELETE n", g=f"user--{uid}")
         _cypher(svc, "MATCH ()-[r:RELATES_TO {group_id: $g}]->() DELETE r", g=f"user--{uid}")
+
+    unique_ns.on_cleanup(_purge)
+    return uid
 
 
 def _cypher(svc, query: str, **params):
@@ -99,22 +101,10 @@ def _wait(predicate, timeout=30.0, step=1.0):
     return False
 
 
-def _conversation(tag: str) -> list[dict]:
-    return [
-        {"role": "user", "content": (
-            f"Quick facts about me for my profile. My dog is named Quillfeather{tag}. "
-            f"I live in Reykjavik{tag} since last March. My favourite tea is smoked "
-            f"lapsang souchong{tag}."
-        )},
-        {"role": "assistant", "content": "Noted, thanks for sharing."},
-    ]
-
-
 def test_delete_one_fact_repairs_siblings_then_bulk_wipe(svc, user):
     import worker
 
-    tag = uuid.uuid4().hex[:6]
-    stored = svc.extract_and_store(_conversation(tag), user_id=user)
+    stored = svc.extract_and_store(conversation(), user_id=user)
     assert len(stored) >= 2, f"extraction produced {len(stored)} fact(s); need >= 2 siblings"
 
     rows = _rows(svc, user)
@@ -126,10 +116,10 @@ def test_delete_one_fact_repairs_siblings_then_bulk_wipe(svc, user):
     assert any(e["uuid"] == episode_uuid for e in _episodes(svc, user))
 
     # --- delete ONE fact (chosen deterministically: the one carrying the seed token) --
-    seed = f"Quillfeather{tag}".lower()
-    victims = [r for r in rows if seed in r["payload"].get("data", "").lower()]
+    victim_ids = select_victims([(r["id"], r["payload"].get("data", "")) for r in rows])
+    victims = [r for r in rows if r["id"] in victim_ids]
     assert len(victims) == 1, (
-        f"expected exactly one extracted fact containing {seed!r}, got "
+        f"expected exactly one extracted fact mentioning {VICTIM_MARKER!r}, got "
         f"{[r['payload'].get('data') for r in rows]}"
     )
     victim = victims[0]
@@ -173,8 +163,8 @@ def test_delete_one_fact_repairs_siblings_then_bulk_wipe(svc, user):
     blob = " ".join(
         str(x) for key in ("edges", "episodes", "nodes") for x in (hits.get(key) or [])
     ).lower()
-    assert tag.lower() not in blob, "deleted fact text is still reachable through graph search"
-    assert svc.search_episodes_fulltext(f"Quillfeather{tag}", user_id=user) == []
+    assert VICTIM_MARKER.lower() not in blob, "deleted fact text is still reachable through graph search"
+    assert svc.search_episodes_fulltext(VICTIM_MARKER, user_id=user) == []
 
     # --- siblings get re-enrichment jobs; run them inline ----------------
     jobs = out["graph_jobs"]

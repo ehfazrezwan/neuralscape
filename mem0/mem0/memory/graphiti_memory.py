@@ -77,26 +77,38 @@ def _create_llm_client(
         raise ValueError(f"Unsupported Graphiti LLM provider: {provider}")
 
 
-def _create_embedder(provider: str, model: str | None, api_key: str | None):
-    """Create a Graphiti embedder client based on provider name."""
+def _create_embedder(
+    provider: str,
+    model: str | None,
+    api_key: str | None,
+    embedding_dim: int | None = None,
+):
+    """Create a Graphiti embedder client based on provider name.
+
+    NEURALSCAPE PATCH: ``embedding_dim`` is passed explicitly. Without it the
+    config inherits Graphiti's ambient ``EMBEDDING_DIM`` env default (1024),
+    which nothing in the deployment sets, so the stored graph vector size was
+    an accident of the environment. ``None`` keeps that legacy behaviour.
+    """
+    dim_kwargs = {"embedding_dim": int(embedding_dim)} if embedding_dim else {}
     if provider == "gemini":
         from graphiti_core.embedder.gemini import GeminiEmbedder, GeminiEmbedderConfig
 
-        config = GeminiEmbedderConfig(api_key=api_key)
+        config = GeminiEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return GeminiEmbedder(config=config)
     elif provider == "openai":
         from graphiti_core.embedder.openai import OpenAIEmbedder, OpenAIEmbedderConfig
 
-        config = OpenAIEmbedderConfig(api_key=api_key)
+        config = OpenAIEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return OpenAIEmbedder(config=config)
     elif provider == "voyage":
         from graphiti_core.embedder.voyage import VoyageEmbedder, VoyageEmbedderConfig
 
-        config = VoyageEmbedderConfig(api_key=api_key)
+        config = VoyageEmbedderConfig(api_key=api_key, **dim_kwargs)
         if model:
             config.embedding_model = model
         return VoyageEmbedder(config=config)
@@ -157,6 +169,13 @@ class _AsyncBridge:
 
     def __init__(self):
         self._loop = asyncio.new_event_loop()
+        self._stopped = False
+        # Futures handed out by run() that have not finished. shutdown() cancels
+        # whatever is left in here, so a caller blocked on a loop that was stopped,
+        # wedged or missed by the task snapshot is released instead of waiting out
+        # the bridge limit. ``_state_lock`` orders "stopped" against "submitted".
+        self._state_lock = threading.Lock()
+        self._inflight: set = set()
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -175,9 +194,32 @@ class _AsyncBridge:
         service's graph callers already log and treat as non-critical.
         """
         limit = timeout if timeout is not None and timeout > 0 else _bridge_timeout_from_env()
-        future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+        with self._state_lock:
+            # Checked and submitted under the lock shutdown() takes to set the flag:
+            # a call either fails here, or is tracked before shutdown's final sweep.
+            if self._stopped or self._loop.is_closed():
+                stopped = True
+            else:
+                stopped = False
+                try:
+                    future = asyncio.run_coroutine_threadsafe(coro, self._loop)
+                except RuntimeError:
+                    stopped = True
+                else:
+                    self._inflight.add(future)
+        if stopped:
+            if asyncio.iscoroutine(coro):
+                coro.close()  # never leave an un-awaited coroutine behind
+            raise RuntimeError("Graphiti bridge is shut down")
+        future.add_done_callback(self._inflight.discard)
         try:
             return future.result(timeout=limit)
+        except concurrent.futures.CancelledError:
+            if self._stopped:
+                raise RuntimeError(
+                    "Graphiti bridge was shut down while this call was waiting"
+                ) from None
+            raise
         except concurrent.futures.TimeoutError:
             if future.done():
                 # The coroutine itself raised TimeoutError (driver/LLM timeout,
@@ -190,6 +232,77 @@ class _AsyncBridge:
             raise TimeoutError(
                 f"Graphiti bridge call did not finish within {limit:g}s and was cancelled"
             ) from None
+
+    def _release_waiters(self) -> None:
+        """Cancel every future run() handed out that is still pending, so its waiter
+        returns now (concurrent futures need no loop to cancel)."""
+        with self._state_lock:
+            leftover = list(self._inflight)
+        for future in leftover:
+            future.cancel()
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        """NEURALSCAPE PATCH: stop the bridge loop cleanly (not in upstream).
+
+        Cancel outstanding tasks, shut down async generators, stop the loop and
+        join its thread. Fire-and-forget work scheduled on the loop (the driver
+        schedules its index build there at construction) must not outlive the
+        loop: left running it surfaces later as 'Event loop is closed' / 'no
+        running event loop' noise. Idempotent; a later ``run()`` raises
+        RuntimeError.
+        """
+        with self._state_lock:
+            self._stopped = True
+        try:
+            self._shutdown_loop(timeout)
+        finally:
+            # On every path (late submit missed by the task snapshot, a loop that never
+            # answered, a stopped loop): nobody stays blocked in run().
+            self._release_waiters()
+
+    def _shutdown_loop(self, timeout: float) -> None:
+        if self._loop.is_closed():
+            return
+
+        async def _cancel_all():
+            current = asyncio.current_task()
+            pending = [t for t in asyncio.all_tasks() if t is not current]
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            await self._loop.shutdown_asyncgens()
+
+        if not self._loop.is_running():
+            # The loop was already stopped (nothing can answer a cancel request):
+            # skip the wait for it, just release the loop.
+            self._thread.join(timeout=timeout)
+            if not self._thread.is_alive():
+                # The thread is gone, so nothing else drives the loop: run the
+                # cancellation here, bounded, so tasks still pending on it are
+                # cancelled (and never-started coroutines closed) before it closes.
+                try:
+                    self._loop.run_until_complete(
+                        asyncio.wait_for(_cancel_all(), timeout=timeout)
+                    )
+                except Exception:
+                    logger.warning(
+                        "Graphiti bridge shutdown: cancelling tasks on a stopped loop failed",
+                        exc_info=True,
+                    )
+                self._loop.close()
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(_cancel_all(), self._loop).result(timeout=timeout)
+        except Exception:
+            logger.warning("Graphiti bridge shutdown: cancelling tasks failed", exc_info=True)
+        self._loop.call_soon_threadsafe(self._loop.stop)
+        self._thread.join(timeout=timeout)
+        if not self._thread.is_alive():
+            self._loop.close()
+        else:
+            logger.warning(
+                "Graphiti bridge thread did not stop within %.0fs; abandoning it", timeout
+            )
 
 
 def _hybrid_egress_ok(text: str) -> bool:
@@ -249,6 +362,7 @@ class MemoryGraph:
             provider=graph_config.graphiti_embedder_provider,
             model=graph_config.graphiti_embedder_model,
             api_key=graph_config.graphiti_embedder_api_key,
+            embedding_dim=getattr(graph_config, "graphiti_embedding_dim", None),
         )
 
         # NEURALSCAPE PATCH: attach the optional decision client only when the
@@ -301,49 +415,34 @@ class MemoryGraph:
                 self._indices_built = True
 
     def _get_group_id(self, filters: dict) -> str:
-        """Build composite group_id from mem0 filters.
+        """Return the explicit ``group_id`` the caller names.
 
-        Supports namespace scoping:
-        - If filters contain an explicit 'group_id', use it directly.
-        - If filters contain 'project_id', returns 'project:{project_id}'.
-        - Otherwise returns 'global' (overarching/cross-project memories).
-
-        Falls back to user_id for backward compatibility with old callers
-        that don't use the new scoping model.
+        NEURALSCAPE PATCH: the upstream-style fallbacks are gone. This used to
+        derive ``project:{project_id}``, ``global`` or the bare ``user_id`` when
+        no ``group_id`` was passed, and the service never reads those names: its
+        groups come from ``memory.groups._build_group_id`` (pool + owner +
+        project + workspace). A caller that omitted ``group_id`` would have
+        written, searched or DELETED graph data in a namespace nothing else
+        sees. No service caller does (every call site passes ``group_id`` or
+        ``group_ids``), so the fallback is replaced by a hard error.
         """
-        # Explicit group_id takes precedence (used by MemoryService)
-        if "group_id" in filters:
-            return filters["group_id"]
-
-        # New scoping model
-        project_id = filters.get("project_id")
-        if project_id:
-            return f"project:{project_id}"
-
-        # Default to global for new callers, user_id for legacy callers
-        scope = filters.get("scope")
-        if scope is not None:
-            return "global"
-
-        # Legacy: use user_id as group_id for backward compatibility
-        return filters.get("user_id", "default")
+        group_id = filters.get("group_id")
+        if not group_id:
+            raise ValueError(
+                "MemoryGraph requires an explicit 'group_id' in filters (build it with "
+                "memory.groups._build_group_id); the legacy project:/user_id fallback was removed"
+            )
+        return group_id
 
     def _get_group_ids(self, filters: dict) -> list[str]:
-        """Get list of group_ids for multi-scope search.
+        """Return the explicit ``group_ids`` (or the single ``group_id``) the caller names.
 
-        When project_id is provided, searches both global and project scope.
-        Otherwise returns single group_id.
+        NEURALSCAPE PATCH: see ``_get_group_id``; no implicit ``["global", "project:{id}"]``.
         """
-        # Explicit group_ids takes precedence
-        if "group_ids" in filters:
-            return filters["group_ids"]
-
-        project_id = filters.get("project_id")
-        if project_id:
-            return ["global", f"project:{project_id}"]
-
-        group_id = self._get_group_id(filters)
-        return [group_id]
+        group_ids = filters.get("group_ids")
+        if group_ids:
+            return list(group_ids)
+        return [self._get_group_id(filters)]
 
     def _build_source_description(self, filters: dict) -> str:
         """Build a source description string from mem0 filters for episode metadata."""
@@ -486,6 +585,9 @@ class MemoryGraph:
                     "destination": target_name,
                 })
 
+            if self._update_communities:
+                await self._ensure_group_communities(group_id)
+
             # NEURALSCAPE PATCH: surface the resolved episode identity so
             # callers can persist a durable memory→episode back-reference
             # (see neuralscape-service/memory/provenance.py). Additive —
@@ -504,6 +606,76 @@ class MemoryGraph:
             logger.error(f"Graphiti add_episode failed: {e}")
             raise
 
+    async def _ensure_group_communities(self, group_id: str) -> None:
+        """NEURALSCAPE PATCH: build the first set of communities for a group.
+
+        ``add_episode(update_communities=True)`` only attaches new entities to
+        communities that already exist (``update_community`` returns nothing
+        when there is none to join), and nothing else ever creates the first
+        one, so with the flag on ``GET /v1/graph/communities`` stayed empty
+        forever. When the flag is on and this group has no *populated*
+        community yet, build them with Graphiti's clustering, scoped to THIS
+        group only (``Graphiti.build_communities`` calls ``remove_communities``,
+        which deletes every community of every group, so it is deliberately not
+        used). Later episodes grow them through ``update_community``.
+
+        Safe across processes: community and membership uuids are derived from
+        the group and the cluster (smallest member uuid), and Graphiti saves
+        with ``MERGE`` on uuid, so two workers that build at the same moment
+        write the same nodes and edges instead of duplicates. A community
+        without any ``HAS_MEMBER`` edge (a build that died between the node and
+        edge saves) counts as "not built": it is removed and rebuilt by the
+        next write. The in-process lock is per group.
+
+        Best-effort: the episode is already stored, so a failure here is logged
+        and never fails the write.
+        """
+        import uuid as _uuid
+
+        from graphiti_core.helpers import semaphore_gather
+        from graphiti_core.utils.maintenance.community_operations import build_communities
+
+        locks = self.__dict__.setdefault("_communities_locks", {})
+        lock = locks.get(group_id)
+        if lock is None:
+            lock = locks.setdefault(group_id, asyncio.Lock())
+        async with lock:
+            try:
+                g = self.graphiti
+                records, _, _ = await g.driver.execute_query(
+                    "MATCH (c:Community {group_id: $g}) "
+                    "RETURN c.uuid AS uuid, EXISTS { (c)-[:HAS_MEMBER]->() } AS populated",
+                    g=group_id,
+                )
+                if any(r["populated"] for r in records):
+                    return
+                if records:
+                    await g.driver.execute_query(
+                        "MATCH (c:Community {group_id: $g}) WHERE NOT EXISTS { (c)-[:HAS_MEMBER]->() } "
+                        "DETACH DELETE c",
+                        g=group_id,
+                    )
+                nodes, edges = await build_communities(g.driver, g.llm_client, [group_id])
+                if not nodes:
+                    return
+                for node in nodes:
+                    members = sorted(e.target_node_uuid for e in edges if e.source_node_uuid == node.uuid)
+                    old = node.uuid
+                    node.uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"ns-community:{group_id}:{members[0] if members else old}"))
+                    for e in edges:
+                        if e.source_node_uuid == old:
+                            e.source_node_uuid = node.uuid
+                            e.uuid = str(_uuid.uuid5(_uuid.NAMESPACE_URL, f"ns-community-member:{node.uuid}:{e.target_node_uuid}"))
+                await semaphore_gather(
+                    *[n.generate_name_embedding(g.embedder) for n in nodes],
+                    max_coroutines=g.max_coroutines,
+                )
+                await semaphore_gather(*[n.save(g.driver) for n in nodes], max_coroutines=g.max_coroutines)
+                await semaphore_gather(*[e.save(g.driver) for e in edges], max_coroutines=g.max_coroutines)
+                logger.info(f"Built {len(nodes)} initial communities for group_id={group_id}")
+            except Exception as e:
+                logger.warning(f"Initial community build failed for group_id={group_id} (non-fatal): {e}")
+
     def search(self, query, filters, limit=100):
         """Search the graph via Graphiti's hybrid search.
 
@@ -514,6 +686,10 @@ class MemoryGraph:
 
         Returns:
             list[dict]: List of {"source", "relationship", "destination"} triples.
+
+        Raises:
+            Exception: whatever the Graphiti bridge raised (never disguised as
+            an empty result).
         """
         self._ensure_indices()
         group_ids = self._get_group_ids(filters)
@@ -531,8 +707,11 @@ class MemoryGraph:
             logger.info(f"Graphiti search returned {len(results)} results")
             return results
         except Exception as e:
-            logger.error(f"Graphiti search failed: {e}")
-            return []
+            # NEURALSCAPE PATCH: a broken bridge must not look like an empty
+            # graph. Log with the traceback and let the caller decide whether
+            # to degrade.
+            logger.error(f"Graphiti search failed: {e}", exc_info=True)
+            raise
 
     def delete_all(self, filters):
         """Delete all graph data for a user/group via Graphiti.
@@ -563,6 +742,9 @@ class MemoryGraph:
 
         Returns:
             list[dict]: List of {"source", "relationship", "target"} triples.
+
+        Raises:
+            Exception: whatever the Graphiti bridge raised (see search()).
         """
         self._ensure_indices()
         group_ids = self._get_group_ids(filters)
@@ -592,5 +774,6 @@ class MemoryGraph:
             logger.info(f"Graphiti get_all returned {len(results)} relationships")
             return results
         except Exception as e:
-            logger.error(f"Graphiti get_all failed: {e}")
-            return []
+            # NEURALSCAPE PATCH: see search() — surface the failure.
+            logger.error(f"Graphiti get_all failed: {e}", exc_info=True)
+            raise

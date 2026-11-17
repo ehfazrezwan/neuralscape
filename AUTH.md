@@ -91,6 +91,22 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
    to an existing id, **preserving memories already stored under that id**.
 2. **Slug** — everyone else gets a deterministic slug:
    `alice.smith@example.com` → `alice.smith-example.com`.
+   The slug is lossy (`a+b@x.com` and `a-b@x.com` both give `a-b-x.com`), so a
+   **first login whose slug is already linked to a different sub/email (or seeded
+   in `AUTH_IDENTITY_MAP` for another email) gets `<slug>-<8 hex of sha256(email)>`
+   instead** (`login_providers.provision_user_id`, checked when the link page is
+   shown and again when `/oauth/link` provisions it). Existing links and the
+   first claimant keep the plain slug, so no existing id changes. The claim is
+   reserved atomically in Redis (`ns:identity:owner`, HSETNX), so two simultaneous
+   first logins cannot both take one slug. **Fails closed:** if Redis is
+   unreachable, a login that is not already resolved by the `AUTH_IDENTITY_MAP`
+   seed gets a 503 "identity store unavailable, try again" page (already-linked
+   users also wait, since the link lives in the same Redis); nobody is guessed
+   onto a plain slug. The check sees links, reservations and the seed, not
+   memories, so **before enabling**, backfill users who have memories under a slug
+   but were never linked:
+   `uv run python scripts/identity.py backfill --from-env --file users.txt`
+   (lines `email:user_id`; dry-run by default, add `--apply`).
 
 > **Migration:** if memories are already keyed by short ids (e.g. `alice`),
 > map those people in `AUTH_IDENTITY_MAP` before flipping a provider on, or
@@ -101,7 +117,9 @@ hidden and `POST /oauth/authorize` rejects token submits). It's always shown for
 A login is accepted only when the email is **verified** AND
 (`domain ∈ AUTH_ALLOWED_DOMAINS` OR `email ∈ AUTH_EMAIL_ALLOWLIST`).
 Both lists are comma-separated and case-insensitive; a leading `@` on a domain
-is tolerated. **An empty allowlist denies everyone (fail-closed).**
+is tolerated. The raw address is judged, never trimmed: it must contain exactly one
+`@` with a non-empty local part and domain and no whitespace, control or
+invisible characters, or it is denied. The Supabase hook applies the same rule. **An empty allowlist denies everyone (fail-closed).**
 
 - `google`: this env allowlist is the sole gate (must be configured).
 - `supabase`: the Supabase hook is the canonical gate; the env allowlist is
@@ -139,22 +157,98 @@ the bound user is the default user.
 ## Token revocation
 
 A per-user token is valid until it expires (forever, for one issued with
-`--no-expiry`). To revoke a leaked token:
+`--no-expiry`). Revoking works on the token's SHA-256 digest; the token itself
+is never stored or printed. Two lists are enforced together (their union):
 
-```bash
-printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py   # prints a SHA-256 digest
-# add it to the server env, comma-separated, then restart:
-NEURALSCAPE_REVOKED_TOKENS=<digest>[,<digest>...]
-```
+1. **Live, no restart: the Redis set `ns:auth:revoked_tokens`.**
+
+   ```bash
+   printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py --redis      # revoke
+   printf '%s' "$LEAKED_TOKEN" | python scripts/revoke_token.py --unrevoke   # undo
+   python scripts/revoke_token.py --digest <sha256-hex> --unrevoke          # undo without the token
+   python scripts/revoke_token.py --list                                    # show revoked digests
+   ```
+
+   The script uses `REDIS_URL`. Every API process re-reads the set at most every
+   `REVOCATION_REFRESH_INTERVAL_SECONDS` (default 5; 0 = on every request), so a
+   revocation takes effect on all instances within that many seconds, and a
+   request costs no Redis round trip while the cached snapshot is fresh.
+2. **Static fallback: `NEURALSCAPE_REVOKED_TOKENS=<digest>[,<digest>...]`**
+   (digest printed by `python scripts/revoke_token.py`; needs a restart). It is
+   always honoured, whatever state Redis is in.
 
 A revoked token is rejected with 401 on REST and MCP, and cannot be pasted into
-the OAuth consent screen. The list holds digests only, never tokens. If the list
-cannot be read, per-user tokens are rejected (fail closed). Limits, plainly:
+the OAuth consent screen. If the env list cannot be parsed, per-user tokens are
+rejected (fail closed).
 
-- Revoking needs an env edit and a restart.
-- It covers the exact token string only.
-- OAuth refresh tokens and sessions already minted from a leaked token are not
-  revoked (refresh tokens are single-use; see the OAuth layer above).
+**When Redis is unreachable** (exact semantics):
+
+- The env list is still enforced.
+- After at least one successful read, the in-process snapshot keeps being
+  enforced: everything revoked up to the outage stays revoked. A revocation
+  made during the outage is not seen until Redis is back (at most one interval
+  after it returns).
+- **Cold start** (the process has not yet completed one successful read of the
+  Redis set): by default (`REVOCATION_FAIL_CLOSED_ON_COLD_START=true`) a valid
+  per-user token gets **503 with `Retry-After: 1`**, not 401, so clients retry
+  and keep their credentials. A token on the env list is still 401, an invalid
+  token still 401, and the public paths (`/health`, `/health/live`,
+  `/.well-known/*`, `/oauth/*`) and the legacy shared key are unaffected. The
+  first load is attempted at startup in the background with a short backoff
+  (and again by requests every `REVOCATION_COLD_RETRY_SECONDS`, default 1), so a
+  start where Redis is healthy never shows the 503 window. Once one load has
+  succeeded, a later outage keeps the last snapshot (above). The detailed
+  `/health` reports `checks.revocation`: `ok`, `unavailable` (cold start, no load
+  yet) or `stale` (loaded, Redis down now). The key is absent only when no
+  per-user token secret is set or `REDIS_URL` is explicitly empty; note that
+  `REDIS_URL` defaults to `redis://localhost:6379`, so a deployment with per-user
+  tokens and no Redis at all gets 503 on every per-user call (Redis is required
+  anyway). Set `REVOCATION_FAIL_CLOSED_ON_COLD_START=false` for such a setup.
+  The OAuth consent paste, the link step and token redemption (code and refresh
+  grants) refuse with 503 `temporarily_unavailable` (same `Retry-After`) during
+  the cold-start window too, so a token revoked in Redis cannot be pasted before
+  the first load.
+  Startup logs a WARNING when it begins without revocation state and another when
+  the first load succeeds. Set the flag to `false` to fail open on the Redis list
+  instead (warning only, env list still enforced).
+- After a failed read the next attempt waits one interval, so an outage adds one
+  short connect timeout (`REVOCATION_REDIS_TIMEOUT_SECONDS`, default 1) per
+  interval, not per request. The warning is logged once per outage window.
+
+Staleness bound: a revocation is enforced at most
+`REVOCATION_REFRESH_INTERVAL_SECONDS` after it is written (plus the request
+that triggers the refresh), per API process.
+
+**OAuth sessions.** Authorization codes, access tokens and refresh tokens carry a
+`src` claim: the digest of the credential the human logged in with (the pasted
+token) or, for Google/Supabase logins, of the identity (`identity_fingerprint`,
+printed by `revoke_token.py --identity <provider>:<user_id>`). `src` is carried
+across refresh rotation. Revoking that digest (live or env list) ends every
+session minted from it: access tokens are 401, refresh and code grants are
+`invalid_grant`. Revoking an OAuth access or refresh token directly works by its
+own digest; revoking a refresh token also revokes its family (the same
+`oauth:revoked_family:<fam>` key #495 uses on reuse), so its successors die too.
+Sessions minted before this change carry no `src` and are covered only by their
+own digests. Unrevoking a refresh token does not resurrect its family.
+
+**Redis durability.** The live denylist exists only in Redis. If Redis loses
+its data (restart without persistence, a flush, a replaced volume), every live
+revocation is forgotten and those tokens work again (API processes drop them
+once their snapshot is refreshed from the now-empty set, or keep them until
+restart if Redis stays down). Run Redis with persistence (`appendonly yes`, or
+RDB snapshots) if you rely on live revocation, and put any digest that must
+never come back in `NEURALSCAPE_REVOKED_TOKENS`: the env list is the durable
+fallback and survives Redis loss. `revoke_token.py --list` shows what the set
+holds.
+
+**The legacy shared key is not covered.** Digest revocation applies to per-user
+tokens (and the OAuth sessions derived from them). A leaked
+`NEURALSCAPE_API_KEY` cannot be revoked by digest: rotate the key and restart.
+
+Limits, plainly:
+
+- It covers the exact token string only (a fresh token for the same user is a
+  different token), plus every OAuth session derived from it (below).
 - Rotate `NEURALSCAPE_USER_TOKEN_SECRET` to invalidate every token.
 - Existing non-expiring tokens keep verifying unless revoked or the secret rotates.
 
@@ -202,7 +296,10 @@ docker compose exec neuralscape python scripts/issue_user_token.py --user alice 
 2. **Allowlist hook:** run [`neuralscape-service/supabase/allowlist_hook.sql`](neuralscape-service/supabase/allowlist_hook.sql)
    in the SQL editor. It creates `signup_email_domains` / `signup_email_addresses`,
    seeds a placeholder `example.com` (replace it), and defines
-   `public.hook_restrict_signup` (default-deny). Then **Authentication → Hooks → Before User Created →
+   `public.hook_restrict_signup` (default-deny). Both tables have row-level
+   security on and no `anon`/`authenticated` access (PostgREST cannot read or
+   edit the allowlist); re-running the script on an older install applies this.
+   Then **Authentication → Hooks → Before User Created →
    Postgres → select `hook_restrict_signup` → Enable.**
    - Add/remove access later with plain SQL — no redeploy:
      ```sql
@@ -234,6 +331,89 @@ exchanges the PKCE `code` for a session (verifier in localStorage, same-origin),
 then POSTs the session JWT to `POST /oauth/supabase/callback`, which verifies it
 and continues the MCP flow. The start and finish pages **must be same-origin**
 (both under `NEURALSCAPE_PUBLIC_URL`) for the PKCE exchange to work.
+
+### Login binding (Google and Supabase)
+
+The signed `login_state` that carries the authorize request across the IdP
+redirect is bound to the browser that started the login, so a state URL built by
+someone else cannot be completed in a victim's browser (login CSRF).
+
+- `GET /oauth/authorize` sets the binding cookie: HttpOnly, `SameSite=Lax`,
+  10 minutes. Its signed value holds the same nonce as the `login_state`. When
+  `NEURALSCAPE_PUBLIC_URL` is https it is `__Host-ns_login_bind` (Secure,
+  `Path=/`, no Domain), so a sibling subdomain or a plain-http origin cannot
+  plant an attacker's cookie; the plain name is then ignored, and a request
+  carrying the cookie name more than once is refused. On plain http (loopback
+  dev) it is `ns_login_bind` with `Path=/oauth`.
+- The callback (`GET /oauth/google/callback`, `POST /oauth/supabase/callback`)
+  requires the cookie, a valid signature and expiry, and
+  `state.nonce == cookie.nonce`. The nonce is then claimed once in Redis
+  (`oauth:login_nonce:<nonce>`, SET NX EX 600). A missing, mismatched, tampered,
+  expired or replayed binding answers 4xx with a "Sign-in failed" page and issues
+  no code. If Redis is down the callback answers 503 and issues nothing (fail
+  closed); the cookie is kept so the user can retry.
+- `SameSite=Lax` is sufficient: Google returns by a top-level GET, and the
+  Supabase finisher POSTs from this origin. `Strict` would drop the cookie on the
+  cross-site GET.
+- Operator notes: the https cookie is `Secure`, so reaching the app over plain
+  http while `NEURALSCAPE_PUBLIC_URL` is https (a tunnel or port-forward) drops
+  it and every federated login is refused; use the https URL, or set the public
+  URL to the http address you really use. The `__Host-` cookie has `Path=/`, so a
+  reverse proxy that serves the app under a path prefix still works if it
+  forwards the `Cookie` header and `Set-Cookie` unmodified; a proxy that rewrites
+  cookie paths or strips `Set-Cookie`/`Cookie` breaks it.
+- Users must finish the login in the same browser that started it, with cookies
+  enabled. Starting a second login in another tab replaces the cookie, so only
+  the most recent tab can finish.
+
+### Redirect host allowlist (`OAUTH_REDIRECT_HOST_ALLOWLIST`)
+
+`POST /oauth/register` is open: anyone may register a client, so by default any
+https redirect URI is accepted, and so is a phishing client that would receive a
+victim's authorization code. The consent page shows the redirect host so the
+person logging in can see where access goes. To close the door, list the hosts
+you really connect from:
+
+```
+OAUTH_REDIRECT_HOST_ALLOWLIST=claude.ai
+```
+
+- **Empty (the default) changes nothing**: any https redirect URI, or http to a
+  loopback host, as before.
+- Comma-separated, case-insensitive entries: `host` or `host:port`. Entries are
+  exact hostnames (no wildcards, no suffix matching). A bare `host` matches the
+  scheme's default port only (`https://claude.ai` and `https://claude.ai:443`,
+  not `https://claude.ai:8443`); write `claude.ai:8443` to allow that port. A
+  `host:port` entry does not also open the default port.
+- **Loopback exemption.** Redirect hosts `127.0.0.1`, `localhost` and IPv6 `[::1]`
+  (written `http://[::1]:PORT/cb` in a URI) stay allowed, with any port and
+  either scheme, even when the list is set. Native clients (RFC 8252 section
+  7.3) listen on an ephemeral loopback port, so no list could name it, and such a
+  redirect only reaches the user's own machine. Loopback entries are never needed
+  in the list. Other IPv6 literals cannot be listed (entries with brackets or
+  colons other than a port are rejected at startup).
+- It sits on top of the existing rules and never widens them: http to a
+  non-loopback host, userinfo, fragments and non-ASCII or percent-encoded hosts
+  stay refused.
+- **Startup validation.** A malformed value stops the service at startup with a
+  clear error instead of being ignored (an ignored list would fail open): empty
+  entries (doubled or trailing comma, or a value of only separators), a scheme,
+  path, userinfo or wildcard, non-ASCII (use the punycode form), or a port that is
+  not 1-65535.
+- **Where it is enforced.** At `POST /oauth/register` (400
+  `invalid_redirect_uri`; every URI in the request must pass); at `GET` and
+  `POST /oauth/authorize` (400 `invalid_request`, `redirect_uri mismatch`); at
+  every code issuance (`_issue_code_and_redirect`: token paste, the Google and
+  Supabase callbacks, and `/oauth/link`, which refuses before persisting
+  anything), where a refusal renders a "Sign-in failed" page and issues no code;
+  and at `POST /oauth/token`, which refuses to redeem a code whose redirect host
+  is no longer listed (`invalid_grant`). So a client registered, a login started,
+  a link ticket minted or a code issued before the list was set stops working
+  once its host is not listed. Access and refresh tokens already issued are not
+  touched: end those with token revocation.
+- Recommendation for production: set it to the callback hosts you use (for
+  example the Claude connector's). Setting it is a deployment step; the default
+  stays empty.
 
 ---
 

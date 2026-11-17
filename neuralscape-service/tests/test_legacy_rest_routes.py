@@ -235,6 +235,56 @@ def test_delete_all_scroll_failure_is_5xx_not_ok(client, real_service):
     assert "nothing was deleted" in resp.json()["detail"]
 
 
+def test_v1_bulk_delete_listing_failure_is_503_not_200(client, real_service):
+    """``DELETE /v1/memories`` answered 200 "No memories deleted (scroll failed)"."""
+    def boom(user_id):
+        raise RuntimeError("qdrant down")
+
+    real_service._scroll_all_user_memories = boom
+    resp = client.request("DELETE", "/v1/memories", json={"user_id": "u1"})
+    assert resp.status_code == 503, resp.text
+    assert "nothing was deleted" in resp.json()["detail"]
+    real_service._memory.delete_all.assert_not_called()
+
+
+def test_v1_bulk_delete_include_shared_listing_failure_deletes_nothing(client, real_service):
+    """include_shared must not run ``delete_all`` when the graph cleanup could not list the rows."""
+    def boom(user_id):
+        raise RuntimeError("qdrant down")
+
+    real_service._scroll_all_user_memories = boom
+    resp = client.request("DELETE", "/v1/memories", json={"user_id": "u1", "include_shared": True})
+    assert resp.status_code == 503, resp.text
+    real_service._memory.delete_all.assert_not_called()
+
+
+def test_service_bulk_delete_raises_instead_of_returning_a_message(real_service):
+    from memory.delete import MemoryListingFailed
+
+    def boom(user_id):
+        raise RuntimeError("qdrant down")
+
+    real_service._scroll_all_user_memories = boom
+    with pytest.raises(MemoryListingFailed):
+        real_service.delete_memories(user_id="u1")
+
+
+def test_v1_bulk_delete_per_row_failures_are_a_207_naming_the_failed_rows(client, real_service):
+    """A good listing with one failing row is a 207 'partial' that names the row (never a clean 200)."""
+    real_service._memory.vector_store = MagicMock()
+    real_service._memory.vector_store.delete.side_effect = [RuntimeError("row failed"), None]
+    real_service._scroll_all_user_memories = lambda uid: [
+        {"id": f"p{i}", "payload": {"data": "x", "metadata": {"visibility": "private"}}} for i in (1, 2)
+    ]
+    real_service._expire_graph_edges_for_groups = MagicMock()
+    real_service._cascade_or_fallback_expire = MagicMock(return_value={"resolved": True})
+    resp = client.request("DELETE", "/v1/memories", json={"user_id": "u1"})
+    assert resp.status_code == 207, resp.text
+    body = resp.json()
+    assert body["status"] == "partial" and body["failed_ids"] == ["p1"] and body["failed"] == 1
+    assert "Deleted 1 private memories" in body["message"]
+
+
 def test_service_delete_all_cascades_each_private_row_and_keeps_shared(real_service):
     """Service-level proof behind the route: every PRIVATE row goes through the
     provenance cascade and the vector delete; shared rows are untouched."""

@@ -4,13 +4,30 @@ Automatic memory capture from conversations. Implements Karpathy's "LLM Wiki" pa
 
 ## What It Does
 
-1. **Flush** — Extracts facts, decisions, preferences, and patterns from conversation turns using Gemini. Stores them in NeuralScape and appends to daily log files in the Obsidian vault.
+1. **Flush** — Runs each conversation turn through the main extraction path (the same one `remember_conversation` uses: one prompt, the core category set, speaker and `occurred_at` handling, content-hash dedup) in a single LLM call, stores the facts in NeuralScape, then mirrors the shared ones into the Obsidian vault (category folders and the daily log). A turn yields one memory shape whichever route it arrives by.
 
-2. **Compile** — Synthesizes daily logs into structured articles: session summaries, project pages, decision records, and research articles. Updates the vault index and triggers dedup.
+2. **Compile** — Synthesizes daily logs into structured articles: session summaries, project pages, decision records, and research articles. Updates the vault index and triggers dedup for each user whose entries were compiled (the semantic phase is skipped when `DREAMING_ENABLED` is on, like the dedup cron). Daily-log entries carry the memory's core category: `decision` feeds the decision article and `domain_knowledge` feeds the research article.
 
 3. **Lint** — Runs 7 health checks on the vault: broken links, orphan pages, stale content, missing cross-references, contradictions (LLM-powered), data gaps, and index drift.
 
 4. **Query** — Index-guided retrieval: reads the vault index to find relevant pages, retrieves content, and synthesizes answers via Gemini. Optionally files answers back as new pages.
+
+## The vault is one shared tree (single-operator by design)
+
+The Obsidian vault is a single directory tree shared by every user the server
+serves: the category folders, the daily logs, the compiled articles, `index.md`
+and `log.md` are not partitioned by user. Only memories with `shared` visibility
+are ever written to it (private memories never reach the vault), but everything
+that is written lands in the same place and is readable by whoever can read the
+vault, and `POST /query` and `POST /lint` operate over the whole tree.
+
+That is the intended design: the vault belongs to one operator (the person or
+team who runs the server and reads the vault), and the extension is not a
+per-user store. Do not point it at a vault that several unrelated people should
+not see together. **Multi-user note.** On a multi-user instance the mirror writes the shared-category facts (decisions, conventions, architecture, ...) extracted from ANY user's `/flush` or `remember_conversation` into this one operator vault, although those rows stay private to their owner in recall (conversation extraction stamps every row `visibility=private`). The mirror decides by the category's default tier, not by that stamp; a fact the sensitivity gate forced private is never mirrored. Only rows the extraction itself created are treated this way: a fact that dedups onto an existing row (for example an explicit private write of the same text) is decided by that row's own stored visibility. Explicit writes are mirrored when their own visibility is shared; an explicit write with no stored visibility falls back to its category's default tier. There is no per-user restriction on the vault.
+
+Each daily-log entry records its owner (`_(user: ...)_`) so
+the post-compile dedup can run for every user whose entries were compiled.
 
 ## Configuration
 
@@ -22,7 +39,6 @@ All via environment variables:
 | `COMPILER_LLM_MODEL` | (NeuralScape default) | Gemini model for extraction/compilation |
 | `COMPILE_AFTER_HOUR` | `18` | Hour (24h) after which auto-compilation runs |
 | `AUTO_COMPILE` | `true` | Whether to auto-compile daily logs |
-| `NEURALSCAPE_URL` | `http://localhost:8199` | NeuralScape API URL |
 
 ## API Endpoints
 

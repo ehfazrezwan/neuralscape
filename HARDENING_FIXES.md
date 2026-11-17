@@ -1,5 +1,7 @@
 # ICE v2 Hardening Fixes — Fable Review MUST-FIX Items
 
+> **Status (as of 2026-11-16, dev 6a81341f):** historical. A record of the independent-review fixes applied during the ICE v2 work. The M3 item (the `knowledge_system` parameter) has since been superseded: the parameter is wired for the code tools and is no longer marked EXPERIMENTAL. File and line citations below are as of that change and have drifted.
+
 This document details the fixes applied to address all 5 MUST-FIX items from the Fable review (ice-v2-fable-review.md §5), plus 2 cheap known-issues (KI#6, KI#12).
 
 ## M1: Placeholder Fusion Defect (CRITICAL - Production Recall Regression)
@@ -23,7 +25,7 @@ This document details the fixes applied to address all 5 MUST-FIX items from the
 - Implemented project-scoped filtering: when `project_id` is provided, code systems are eligible ONLY if they have a REAL indexed code_space for that project.
 - Capability placeholders (`code_space == "__registry_capability__"`) and engines with `G=None` are NOT eligible for project-scoped queries.
 - Base systems remain always eligible (not project-scoped).
-- TODO Phase G: Also check if code_space matches the project's repo (e.g. `code--owner--{project_repo}`).
+- A code_space bound to a project must match that project's repo: an engine whose code_space differs from the `code_space` in the project's knowledge config (and does not map to the same `CODE_REPOS` directory) is not eligible, and the reason is logged (`code_space_matches_project`). A project with no recorded code_space is unconstrained.
 
 **Test:** `tests/test_hardening_fixes.py::test_eligible_systems_requires_indexed_code_space_for_project` — verifies placeholder is eligible globally but NOT for project-scoped queries.
 
@@ -33,12 +35,13 @@ This document details the fixes applied to address all 5 MUST-FIX items from the
 
 **The Bug:** The documented `knowledge_system` param on `recall_memories` + 5 code tools was a silent no-op. `RouteDecision.systems` was discarded; code tools dispatched via old `graph_id` path (`mcp_server.py:2019-2022, 2048-2100`); recall read only `wants_code_fusion` which layer-1 never sets. The API contract promised behavior that didn't happen.
 
-**The Fix (mcp_server.py:220-231, 1180-1190):**
+**The Fix as first applied (historical; `mcp_server.py` has since changed, see the Superseded bullet below):**
 - Chose the honest minimal fix: clearly marked `knowledge_system` as "EXPERIMENTAL (not yet fully implemented; full through-NS routing is Phase G)" in BOTH tool schemas.
 - Updated description to state it's "currently logged for debugging but does not change recall/dispatch behavior (fusion defaults to router decision)".
 - Phase G (documented follow-up) will wire explicit routing through the knowledge system seam for all surfaces.
+- **Superseded:** Phase G / AR2 landed that wiring. On the code tools (`query_code_graph`, `get_code_neighbors`, `code_path`, `locate`, `code_impact` and their REST twins) `knowledge_system` + `graph_id` now dispatch through the knowledge-system seam (`knowledge_system="auto"` picks the measured-best healthy engine per op). On `recall_memories` it stays a hint: the code leg is governed by the router's fusion gate. It is no longer a no-op and no longer marked EXPERIMENTAL.
 
-**Impact:** API contract is now honest — parameter is documented as experimental/unimplemented, so no client behavior is poisoned by expecting routing that doesn't happen.
+**Impact:** At the time, the API contract was made honest by documenting the parameter as experimental. Today the parameter is real for the code tools (see the Superseded bullet) and the tool schemas in `mcp_server.py` describe it without the EXPERIMENTAL marker.
 
 ---
 
@@ -134,7 +137,7 @@ This document details the fixes applied to address all 5 MUST-FIX items from the
 ### Acceptance Criteria Met
 ✅ M1 fix: recall_memories output unchanged when no real indexed engine exists  
 ✅ M2 fix: eligible_systems filters placeholders for project-scoped queries  
-✅ M3 fix: knowledge_system param honestly marked experimental/unimplemented  
+✅ M3 fix: knowledge_system param honest (since implemented for the code tools in Phase G / AR2; see M3)  
 ✅ M4 fix: health probe bounded to 2s + cached for 10s  
 ✅ M5 fix: fused recall returns stable JSON envelope  
 ✅ KI#6 fix: coding-signal keywords use word-boundary regexes  

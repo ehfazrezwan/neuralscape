@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SERVICE_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = SERVICE_ROOT / "tests"
 INTEGRATION_DIR = SERVICE_ROOT / "integration_tests"
@@ -28,11 +30,7 @@ FALLBACK_EXCLUDED = ["tests/test_async_pipeline.py"]  # the packaged test image 
 # declared their skips in the manifest.  Lane p2 moves them to integration_tests/
 # (pg_dsn / stores fixtures) and deletes their manifest entries; remove each name
 # here in the same PR.  Never add to this set.
-LEGACY_MARKED = {
-    "test_ledger_dispatch_pg_integration.py",
-    "test_ledger_flag_on_app.py",
-    "test_ledger_postgres_integration.py",
-}
+LEGACY_MARKED: set[str] = set()
 
 
 def _excluded_suites() -> set[str]:
@@ -176,6 +174,72 @@ def test_a_failing_cleanup_fails_the_teardown(tmp_path):
     assert "unique_ns cleanup failed" in out.stdout and "could not drop" in out.stdout
 
 
+def _area_with(tmp_path, files, *, copy_cbm_gate=False):
+    area = tmp_path / "integration_tests"
+    area.mkdir()
+    shutil.copy(INTEGRATION_DIR / "conftest.py", area / "conftest.py")
+    if copy_cbm_gate:
+        shutil.copy(INTEGRATION_DIR / "cbm_gate.py", area / "cbm_gate.py")
+    for name, text in files.items():
+        (area / name).write_text(text, encoding="utf-8")
+    return area
+
+
+_DIRECT_SKIP = "import pytest\n\ndef test_proof():\n    pytest.skip('flag-on proof not run')\n"
+_IMPORTORSKIP = "import pytest\n\nmissing = pytest.importorskip('no_such_driver_nsit')\n\ndef test_proof():\n    pass\n"
+_SKIPIF = "import pytest\n\n@pytest.mark.skipif(True, reason='never runs')\ndef test_proof():\n    pass\n"
+_SKIP_IN_FIXTURE = (
+    "import pytest\n\n@pytest.fixture\ndef dep():\n    pytest.skip('dep missing')\n\n"
+    "def test_proof(dep):\n    pass\n"
+)
+
+
+@pytest.mark.parametrize("source", [_DIRECT_SKIP, _IMPORTORSKIP, _SKIPIF, _SKIP_IN_FIXTURE], ids=["direct", "importorskip", "skipif", "fixture"])
+def test_a_skip_fails_when_integration_is_required_and_still_skips_elsewhere(tmp_path, source):
+    area = _area_with(tmp_path, {"test_proof.py": source})
+
+    relaxed = _pytest([str(area)], tmp_path)
+    # (a module that skips at collection leaves nothing to run, which pytest reports as exit 5)
+    assert relaxed.returncode in (0, 5) and "1 skipped" in relaxed.stdout, relaxed.stdout + relaxed.stderr
+
+    gate = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert gate.returncode not in (0, 5), gate.stdout + gate.stderr
+    assert "skipped" not in gate.stdout.splitlines()[-1], gate.stdout
+    assert "NS_INTEGRATION_REQUIRED is set but a test was skipped" in gate.stdout, gate.stdout
+
+
+def test_an_expected_failure_is_not_turned_into_a_failure_by_the_skip_rule(tmp_path):
+    area = _area_with(tmp_path, {"test_x.py": "import pytest\n\n@pytest.mark.xfail(reason='known')\ndef test_x():\n    assert False\n"})
+    gate = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert gate.returncode == 0 and "1 xfailed" in gate.stdout, gate.stdout
+
+
+_CBM_TEST = (
+    "from integration_tests.cbm_gate import FAIL, SKIP, cbm_decision\nimport pytest\n\n"
+    "def test_cbm():\n"
+    "    action, reason = cbm_decision(lambda url: False)\n"
+    "    if action == FAIL:\n        pytest.fail(reason, pytrace=False)\n"
+    "    if action == SKIP:\n        pytest.skip(reason)\n"
+)
+
+
+def test_the_cbm_waiver_is_the_one_skip_the_gate_allows(tmp_path):
+    area = _area_with(tmp_path, {"test_cbm.py": _CBM_TEST}, copy_cbm_gate=True)
+    waived = _pytest(["-rs", str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1", "NS_INTEGRATION_WAIVE": "cbm"})
+    assert waived.returncode == 0 and "1 skipped" in waived.stdout, waived.stdout + waived.stderr
+    unwaived = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert unwaived.returncode != 0 and "NS_INTEGRATION_WAIVE=cbm" in unwaived.stdout, unwaived.stdout
+
+
+def test_a_skip_cannot_claim_a_waiver_the_profile_did_not_grant(tmp_path):
+    forged = "import pytest\n\ndef test_proof():\n    pytest.skip('[waived:cbm] pretending')\n"
+    area = _area_with(tmp_path, {"test_proof.py": forged})
+    gate = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert gate.returncode != 0, gate.stdout
+    other = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1", "NS_INTEGRATION_WAIVE": "other"})
+    assert other.returncode != 0, other.stdout
+
+
 def test_async_pipeline_fails_when_required_and_skips_otherwise():
     env = {"NS_API_URL": "http://127.0.0.1:9", "NS_API_TOKEN": "", "NEURALSCAPE_USER_TOKEN_SECRET": ""}
     args = ["tests/test_async_pipeline.py", "-m", "integration"]
@@ -223,3 +287,57 @@ def test_redaction_covers_tokens_and_query_secrets(tmp_path):
     )
     out = _pytest([str(area)], tmp_path)
     assert out.returncode == 0, out.stdout + out.stderr
+
+
+def test_minted_bearer_is_created_per_request_and_outlives_the_first_hour(monkeypatch):
+    """A run that lasts longer than the token lifetime must not get 401s: the second
+    call 61 minutes later carries a token that is still valid, for the same user id."""
+    import time as _time
+
+    import tokens
+    from integration_tests.api_identity import TOKEN_TTL_SECONDS, resolve_identity
+
+    secret = "unit-" + "test-signing-" + "value"
+    identity = resolve_identity({"NEURALSCAPE_USER_TOKEN_SECRET": secret})
+    first = identity.headers["Authorization"].split(" ", 1)[1]
+    now = _time.time()
+    monkeypatch.setattr(tokens.time, "time", lambda: now + 61 * 60)
+    assert tokens.verify_user_token(first, secret) is None  # the import-time token has expired
+    later = identity.headers["Authorization"].split(" ", 1)[1]
+    payload = tokens.verify_user_token(later, secret)
+    assert payload is not None and payload["user_id"] == identity.user_id
+    assert payload["exp"] >= int(now) + 61 * 60 + TOKEN_TTL_SECONDS - 1
+
+
+def test_async_pipeline_requests_and_live_api_take_the_bearer_at_request_time(monkeypatch):
+    import time as _time
+
+    import tokens
+    from integration_tests import api_identity
+    from integration_tests.conftest import LiveApi
+
+    secret = "unit-" + "test-signing-" + "value"
+    identity = api_identity.resolve_identity({"NEURALSCAPE_USER_TOKEN_SECRET": secret})
+    api = LiveApi(url="http://h:1", user_id=identity.user_id, identity=identity)
+    now = _time.time()
+    monkeypatch.setattr(tokens.time, "time", lambda: now + 61 * 60)
+    bearer = api.headers["Authorization"].split(" ", 1)[1]
+    assert tokens.verify_user_token(bearer, secret)["user_id"] == identity.user_id
+
+    monkeypatch.setenv("NEURALSCAPE_USER_TOKEN_SECRET", secret)
+    monkeypatch.delenv("NS_API_TOKEN", raising=False)
+    monkeypatch.setenv("NS_API_URL", "http://127.0.0.1:1")  # unreachable: the module skips, imports fine
+    import importlib.util
+    from pathlib import Path as _Path
+
+    spec = importlib.util.spec_from_file_location(
+        "ns_async_pipeline_under_test", _Path(__file__).resolve().parent / "test_async_pipeline.py"
+    )
+    pipeline = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pipeline)
+    monkeypatch.setattr(tokens.time, "time", lambda: now)
+    first = pipeline._auth({})["headers"]["Authorization"]
+    monkeypatch.setattr(tokens.time, "time", lambda: now + 61 * 60)
+    later = pipeline._auth({})["headers"]["Authorization"]
+    assert later != first
+    assert tokens.verify_user_token(later.split(" ", 1)[1], secret)["user_id"] == pipeline.USER_ID

@@ -52,7 +52,13 @@ missing infrastructure is an error, never a skip. Any SKIPPED integration test
 in a gate run must be justified in the PR body, and a test may skip only on a
 declared condition (for example an optional extra that is not installed), never
 for missing stores, keys or API. A cleanup that fails in `unique_ns` fails the
-test's teardown. Store URLs in messages and reprs have their passwords redacted.
+test's teardown.
+This is enforced by `conftest.py`, not left to each test: under `NS_INTEGRATION_REQUIRED=1`
+any skip (a direct `pytest.skip`, a `skipif`/`skip` marker, a skip inside a fixture, a
+module-level `importorskip`) is reported as a failure. The one exception is a skip whose reason
+carries the `[waived:<name>]` tag for a dependency named in `NS_INTEGRATION_WAIVE`.
+
+**Declared exception: CBM.** The cbm-bridge is not in the standard store stack. A gate profile that does not run it sets `NS_INTEGRATION_WAIVE=cbm`, and the CBM flag-on test then skips (the one allowed skip, visible in the output). A profile that runs the bridge sets `CBM_BRIDGE_URL` and waives nothing; an unreachable bridge there fails. Store URLs in messages and reprs have their passwords redacted.
 
 **The per-PR "flag-on proof".** A PR that adds or changes a flagged feature adds
 one test here that (1) calls `flags(...)`, (2) exercises the feature through the
@@ -66,6 +72,8 @@ A test may rely on exactly these variables and nothing else. The gate sets them.
 | Variable | Meaning | Fixture |
 |---|---|---|
 | `NS_INTEGRATION_REQUIRED` | `1` on the gate: missing infrastructure fails instead of skipping | all |
+| `NS_INTEGRATION_WAIVE` | comma list of exact dependency names (`cbm`) a gate profile deliberately does not provide; turns that dependency's REQUIRED failure into a skip. Ignored when `CBM_BRIDGE_URL` is set | `integration_tests/cbm_gate.py` |
+| `CBM_BRIDGE_URL` | http(s) URL of a running cbm-bridge (`--profile cbm`); with `CBM_ENABLED=true` and a `CODE_REPOS` dir visible at the same path to bridge and test. Set but unreachable fails under REQUIRED | `test_code_engines_flag_on.py` CBM test |
 | `NEO4J_URI`, `NEO4J_USER`, `NEO4J_PASSWORD`, `NEO4J_DATABASE` | Neo4j | `stores`, `neo4j_conn` |
 | `QDRANT_URL` | Qdrant | `stores` |
 | `REDIS_URL` | Redis | `stores` |

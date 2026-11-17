@@ -1,5 +1,6 @@
 """Schemas for neuralscape-service: enums, category taxonomy, request/response models."""
 
+import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
@@ -348,6 +349,43 @@ def validate_adapter_name(v: str) -> str:
     return v
 
 
+MAX_RECALL_WORKSPACES = 10
+
+
+WORKSPACE_PATTERN = r"^[a-zA-Z0-9_.\-]+$"
+WORKSPACE_MAX_LENGTH = 100
+_WORKSPACE_RE = re.compile(WORKSPACE_PATTERN)
+
+
+def normalize_workspace(value: str | None) -> str | None:
+    """The workspace a write is stored under: absent, ``""`` and ``"memory"`` all mean the
+    memory workspace and normalise to None (the untagged rows' value), so store_raw's
+    dedup key matches rows written without a workspace. Raises ValueError when malformed."""
+    if value is None or value in ("", "memory"):
+        return None
+    if len(value) > WORKSPACE_MAX_LENGTH or not _WORKSPACE_RE.fullmatch(value):
+        raise ValueError("workspace may only contain letters, digits, '_', '.', '-' (max 100)")
+    return value
+
+
+def validate_workspace_names(v: list[str] | None) -> list[str] | None:
+    """Validate a recall ``workspaces`` list: names match the write-side
+    ``workspace`` pattern, at most MAX_RECALL_WORKSPACES entries, duplicates
+    collapsed. ``[]`` maps to ``None`` (the default)."""
+    import re
+
+    if v is None:
+        return None
+    if v == []:
+        return None  # empty list = default (memory workspace only)
+    if not isinstance(v, list) or len(v) > MAX_RECALL_WORKSPACES:
+        raise ValueError(f"workspaces must list at most {MAX_RECALL_WORKSPACES} workspace names")
+    for name in v:
+        if not isinstance(name, str) or len(name) > 100 or not re.fullmatch(_ID_PATTERN, name):
+            raise ValueError(f"Invalid workspace name {name!r}: use letters, digits, '_', '.', '-' (max 100)")
+    return list(dict.fromkeys(v))
+
+
 # Event time (occurred_at): allow modest client clock skew when rejecting
 # "future" event times — an importer whose clock runs slightly ahead must not
 # be rejected, but a genuinely future date is a caller bug (events haven't
@@ -561,8 +599,8 @@ class RawMemoryRequest(BaseModel):
     # Workspace partition (WT6, optional)
     workspace: str | None = Field(
         default=None,
-        max_length=100,
-        pattern=r"^[a-zA-Z0-9_.\-]+$",
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
         description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
     )
 
@@ -666,8 +704,8 @@ class IngestDocumentRequest(BaseModel):
     )
     workspace: str | None = Field(
         default=None,
-        max_length=100,
-        pattern=r"^[a-zA-Z0-9_.\-]+$",
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
         description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
     )
 
@@ -724,6 +762,12 @@ class IngestTextRequest(BaseModel):
         max_length=100,
         description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy').",
     )
+    workspace: str | None = Field(
+        default=None,
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
+        description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
+    )
     occurred_at: str | None = Field(
         default=None,
         description=(
@@ -778,6 +822,12 @@ class ConnectorConfigRequest(BaseModel):
     default_scope: str = Field(default="global")
     default_project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     default_visibility: MemoryVisibility | None = Field(default=None)
+    default_workspace: str | None = Field(
+        default=None,
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
+        description="Workspace for memories produced by this connector's syncs (absent = memory workspace, or the adapter's reference workspace)",
+    )
 
     @field_validator("connector_type")
     @classmethod
@@ -839,6 +889,20 @@ class SearchMemoryRequest(BaseModel):
             "via POST /v1/memories/batch-get."
         ),
     )
+
+    workspaces: list[str] | None = Field(
+        default=None,
+        description=(
+            "Workspaces to search. Absent = the memory workspace only (default). "
+            "Reference content ingested with a non-default adapter lives in "
+            "'ref-<adapter>[--<title>]'; name it here to recall it."
+        ),
+    )
+
+    @field_validator("workspaces")
+    @classmethod
+    def _validate_workspaces(cls, v: list[str] | None) -> list[str] | None:
+        return validate_workspace_names(v)
 
     @field_validator("domain")
     @classmethod
@@ -922,6 +986,16 @@ class PatchMemoryRequest(BaseModel):
     concepts: list[str] | None = Field(default=None, max_length=5)
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
     expires_at: datetime | None = None
+
+    # Optimistic-concurrency precondition (not an editable field): the
+    # ``revision`` a read of this memory returned. When sent and no longer
+    # current the PATCH is refused with 409 and nothing is written; absent keeps
+    # last-writer-wins.
+    expected_revision: str | None = Field(
+        default=None,
+        max_length=32,
+        description="Revision token from a read of the memory; stale => 409, nothing written",
+    )
 
     @field_validator("domain")
     @classmethod
@@ -1143,7 +1217,8 @@ class BulkDeleteRequest(BaseModel):
         description=(
             "When False (default), shared memories the caller authored are "
             "preserved even on bulk delete — they're team artifacts. Set True "
-            "to also remove the caller's shared writes (admin-style nuke)."
+            "to also delete the caller's OWN shared rows; never another user's "
+            "rows and never standard rows."
         ),
     )
 
@@ -1158,8 +1233,11 @@ class MemoryResponse(BaseModel):
 
     Memory-model v2 fields render as nulls for legacy memories that didn't store them.
     Multi-user fields (`visibility`, `owner_user_id`) likewise render as null on
-    pre-multi-user memories — clients should treat null `visibility` as 'private'
-    and null `owner_user_id` as 'unknown / pre-multi-user write'.
+    pre-multi-user memories — clients should treat null `visibility` as 'private'.
+    A null `owner_user_id` in metadata is filled from the row's top-level `user_id`
+    when the memory is read, so it is only null when the row records neither
+    (pre-multi-user write). Conversation-extracted rows are stamped with both
+    (`owner_user_id`, `visibility=private`) at write time.
     """
     id: str
     memory: str
@@ -1219,6 +1297,11 @@ class MemoryResponse(BaseModel):
     visibility: str | None = None
     owner_user_id: str | None = None
 
+    # Optimistic-concurrency token: echo it as ``expected_revision`` on a PATCH
+    # to refuse the edit if the row changed since this read. "0" for rows that
+    # have never been patched.
+    revision: str | None = None
+
     # Sensitivity gate provenance — stamped whenever the content matched a
     # gated class (memory/sensitivity.py), whether the gate FORCED
     # visibility=private or the caller BYPASSED it with sensitivity_override.
@@ -1264,10 +1347,53 @@ class StoreMemoryResponse(BaseModel):
     task_id: str | None = None
 
 
+class RecallResults(list):
+    """Hybrid recall rows (a plain ``list``) plus how the graph leg fared.
+
+    ``graph_leg`` is ``None`` when the leg contributed, was not configured, or
+    was not part of the call. Otherwise it says why the leg did not contribute:
+    ``"failed"`` (the graph search raised or reported an outage),
+    ``"timed_out"`` (it missed the join timeout or the leg budget) or
+    ``"skipped"`` (it could not be started). Every list consumer is unaffected.
+    """
+
+    graph_leg: str | None = None
+
+    def __init__(self, rows=(), graph_leg: str | None = None):
+        super().__init__(rows)
+        self.graph_leg = graph_leg
+
+
+def graph_leg_signal(results) -> dict:
+    """The additive response fields for a recall whose graph leg was lost.
+
+    Empty (the response is byte-identical to before) unless ``results`` carries
+    a ``graph_leg`` status. Shape: ``{"degraded": True, "graph_leg": <status>}``.
+    """
+    status = getattr(results, "graph_leg", None)
+    return {"degraded": True, "graph_leg": status} if status else {}
+
+
+def _omit_absent_graph_leg_signal(data):
+    if isinstance(data, dict):
+        for key in ("degraded", "graph_leg"):
+            if data.get(key) is None:
+                data.pop(key, None)
+    return data
+
+
 class SearchMemoryResponse(BaseModel):
     status: str = "ok"
     results: list[MemoryResponse] = Field(default_factory=list)
     graph_results: list[dict] | None = None
+    # Additive hybrid-recall signal: present only when the graph leg did not
+    # contribute (see RecallResults); the key is omitted otherwise.
+    degraded: bool | None = None
+    graph_leg: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_signal(self, handler):
+        return _omit_absent_graph_leg_signal(handler(self))
 
 
 class IndexRow(BaseModel):
@@ -1312,6 +1438,13 @@ class SearchIndexResponse(BaseModel):
     # overhead") + the measured numbers behind it. None when the meter is off.
     savings: str | None = None
     savings_detail: SavingsDetail | None = None
+    # Additive hybrid-recall signal, as on SearchMemoryResponse.
+    degraded: bool | None = None
+    graph_leg: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_signal(self, handler):
+        return _omit_absent_graph_leg_signal(handler(self))
 
 
 class GetMemoriesResponse(BaseModel):

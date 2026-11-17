@@ -27,6 +27,7 @@ All OKF name knowledge (keys, reserved files, type mapping) comes from
 from __future__ import annotations
 
 import logging
+import re
 import posixpath
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -36,6 +37,19 @@ from pathlib import Path
 from okf import translate
 
 logger = logging.getLogger(__name__)
+
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")
+_SECRET_RE = re.compile(
+    r"(?i)\b(password|passwd|token|secret|api[_-]?key|access[_-]?key|authorization)\b(\s*[=:]\s*)\S+"
+)
+_BEARER_RE = re.compile(r"(?i)\bBearer\s+\S+")
+
+
+def _scrub(text: str, limit: int = 200) -> str:
+    text = _BEARER_RE.sub("Bearer <redacted>", text)
+    text = _SECRET_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}<redacted>", text)
+    text = _URL_RE.sub("<url>", text)
+    return text[:limit]
 
 #: Cap on relationship-hint memories per bundle (a wiki with thousands of
 #: cross-links should not mint thousands of link rows).
@@ -348,6 +362,7 @@ def ingest_okf_bundle(
     tags: list[str] | None = None,
     extract_facts: bool = True,
     index_passages: bool = True,
+    workspace: str | None = None,
     llm_call: Callable[[str], str] | None = None,
 ) -> dict:
     """Walk + ingest a parsed-out bundle. Returns a summary dict.
@@ -356,9 +371,16 @@ def ingest_okf_bundle(
     :func:`load_bundle_zip`). Deferred graph jobs are returned under
     ``graph_jobs`` for the caller (worker) to enqueue — same contract as
     :func:`ingest.pipeline.ingest_document`.
+
+    The summary reports per-concept outcomes: ``failed`` / ``failed_concepts``
+    (``[{concept_id, error}]``) / ``skipped`` and a ``status`` of
+    ``completed``, ``partial`` or ``failed``. Cross-link memories that fail to
+    store are counted in ``link_failures`` / ``failed_links`` and never change
+    ``status``.
     """
     from ingest.chunking_strategies import OkfFrontmatterStrategy
-    from ingest.pipeline import IngestDoc, ingest_document
+    from ingest.pipeline import IngestDoc, ingest_document, sanitized_error
+    from schemas import normalize_workspace
 
     bundle_name = (
         Path(bundle_uri.rstrip("/")).stem or "okf-bundle"
@@ -374,11 +396,21 @@ def ingest_okf_bundle(
         "links": 0,
         "memory_ids": [],
         "graph_jobs": [],
+        # Per-concept outcome accounting: a bundle whose concepts fail one by
+        # one must not report success. ``skipped`` = concepts with no text.
+        "skipped": 0,
+        "failed": 0,
+        "failed_concepts": [],
+        # Cross-link (relationship) memories that could not be stored. Additive:
+        # they do not change ``status`` (a link is a hint on top of ingested concepts).
+        "link_failures": 0,
+        "failed_links": [],
     }
     anchor_ids: dict[str, str] = {}  # concept_id → one stored memory id
 
     for concept in concepts:
         if not concept.text.strip():
+            summary["skipped"] += 1
             continue
         doc = IngestDoc(
             content=concept.text,
@@ -394,13 +426,34 @@ def ingest_okf_bundle(
             extract_facts=extract_facts,
             index_passages=index_passages,
             chunking_strategy=OkfFrontmatterStrategy.name,
+            workspace=workspace,
         )
         try:
             result = ingest_document(service, doc)
-        except Exception:
+        except Exception as exc:
             logger.exception("OKF concept ingest failed: %s", concept.concept_id)
+            summary["failed"] += 1
+            summary["failed_concepts"].append({
+                "concept_id": concept.concept_id,
+                # class + fixed message only; raw text is in the server log above
+                "error": sanitized_error(exc, "concept"),
+            })
             continue
-        summary["concepts"] += 1
+        # ingest_document tolerates per-chunk store errors (and logs them); it
+        # reports them in ``store_errors``. A concept with any is incompletely
+        # ingested: count it failed, keep whatever did store.
+        store_errors = result.get("store_errors") or []
+        if store_errors:
+            logger.warning("OKF concept %s: %d store errors", concept.concept_id, len(store_errors))
+            summary["failed"] += 1
+            summary["failed_concepts"].append({
+                "concept_id": concept.concept_id,
+                "error": _scrub(store_errors[0]),
+                "stores_failed": result.get("stores_failed", len(store_errors)),
+                "stores_succeeded": result.get("stores_succeeded", 0),
+            })
+        else:
+            summary["concepts"] += 1
         summary["passages"] += result["passages"]
         summary["facts"] += result["facts"]
         summary["memory_ids"].extend(result["memory_ids"])
@@ -452,12 +505,19 @@ def ingest_okf_bundle(
                 ),
                 add_to_graph=False,
                 return_created=True,
+                workspace=normalize_workspace(workspace),
             )
-        except Exception:
+        except Exception as exc:
             logger.warning(
                 "OKF link memory store failed for %s (non-fatal)",
                 concept.concept_id, exc_info=True,
             )
+            summary["link_failures"] += 1
+            summary["failed_links"].append({
+                "concept_id": concept.concept_id,
+                # class + fixed message only; raw text is in the server log above
+                "error": sanitized_error(exc, "link"),
+            })
             continue
         if stored:
             summary["memory_ids"].extend(m.id for m in stored)
@@ -477,10 +537,20 @@ def ingest_okf_bundle(
                         ),
                     })
 
+    # completed: every concept with text ingested; partial: some did, some
+    # failed; failed: concepts were attempted and none ingested.
+    if summary["failed"] == 0:
+        summary["status"] = "completed"
+    elif summary["concepts"] > 0:
+        summary["status"] = "partial"
+    else:
+        summary["status"] = "failed"
+
     logger.info(
-        "OKF bundle ingest %s → %d concepts, %d passages, %d facts, %d links "
-        "(%d graph jobs deferred)",
-        bundle_uri, summary["concepts"], summary["passages"], summary["facts"],
+        "OKF bundle ingest %s → %s: %d concepts, %d failed, %d skipped, %d passages, "
+        "%d facts, %d links (%d graph jobs deferred)",
+        bundle_uri, summary["status"], summary["concepts"], summary["failed"],
+        summary["skipped"], summary["passages"], summary["facts"],
         summary["links"], len(summary["graph_jobs"]),
     )
     return summary

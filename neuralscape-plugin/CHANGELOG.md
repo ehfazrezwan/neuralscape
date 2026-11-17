@@ -4,6 +4,34 @@ All notable changes to the `neuralscape` Claude plugin are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.10] - 2026-11-16
+
+### Fixed
+- PostToolUse capture rendered every structured `tool_response` as raw JSON. It now renders by shape: typed content blocks (MCP results) are stored as their content (text as is, an embedded resource as its text labelled with its uri, image/audio as a `[image]`/`[audio]` placeholder, any other block as its JSON); an empty result (`{}`, `[]`, empty string, null) is stored as empty output; a Bash-style result (boolean `interrupted` plus stdout/stderr) is stored as its stdout/stderr text, with an explicit `[interrupted]` marker when it was interrupted. Any other object is still stored as JSON. Redaction (fail-closed) runs on the rendered text before truncation.
+
+### Added
+- `tests/native-fixtures/`: sanitized synthetic native-client events and transcripts with reviewer-owned expected results, pinned by a SHA-256 manifest, parsed by the plugin's own code (`tests/native-fixtures.test.ts`). Tests only; no behaviour change beyond the fix above.
+
+## [2.9.9] - 2026-11-16
+
+### Added
+- `CONTEXT_MODE=assemble` (opt-in; the default stays `index`): SessionStart also calls `POST /v1/context/assemble`, the service's token-budgeted bundle (identity card, the session's rolling summary and recent messages, and relevant-memory rows for a query), and injects `bundle.text` under "Session context (assembled, ~N of M tokens)". Until now nothing called that route. The request carries `budget_tokens` (`ASSEMBLE_BUDGET_TOKENS`, default 1500, clamped to the route's 100 to 1000000), the Claude session id, the project, the user and `format: "plain"`; `query` is `ASSEMBLE_QUERY` when set, otherwise the last user prompt of the transcript on resume, compact and fork, otherwise none (a fresh session has nothing to rank by, so the bundle then holds the card and the session's own summary and messages). Binding standards, "Resuming after compaction" and "Previously..." come from the context fetch as before; the identity-card block and the index rows the bundle already shows are not rendered again. Any failure of the route falls back to the plain index: a 404 (an older server without the route) quietly, a rejected key or request (401/403, other 4xx) with a one-line notice, 5xx and network failures only on stderr (the index fetch reports a failing service). With any other `CONTEXT_MODE` the route is never called.
+- README: the endpoint inventory lists the new call; both settings are in the settings table and in the plugin's userConfig.
+
+## [2.9.8] - 2026-11-16
+
+### Fixed
+- Privacy: the session note's `completed` took the final assistant entry of the last turn and redacted it on its own, so a `<private>` span opened in an earlier assistant entry and closed in the final one lost its opening tag and its tail was POSTed to `/v1/checkpoint`. Redaction is now decided over the whole turn's assistant text (the spans are found in the joined text and masked in place) before the final entry is cut out, and every turn is redacted over its whole text before any note field (request, learned, next steps) picks a sentence out of it.
+- Privacy: an unclosed `<private>` was redacted only to the end of its line or sentence, so a multi-line private span leaked its later lines. Text that leaves the machine or is written to disk is now redacted fail-closed (`redactPrivate(text, { failClosed: true })`: an unmatched opener redacts through the end of the text): observation rows (every input string, redacted before the 600-character elision, and the output, including JSON-stringified object responses), conversation turns sent to the flush route, the session note, the compact snapshot, and the framework adapter's remembered inbound message. The bounded default mode stays for text that does not leave the machine (the read gate's re-redaction of stored text before it is shown locally).
+- Review follow-ups in the same release: `<private>` spans now nest (the span ends at the closer that balances the outermost opener; the old lazy match ended at the first closer and sent the text between an inner and the outer closer), a closer with no opener redacts back to the start of the text when fail-closed, and a span that opens in the prompt and closes in the answer (or across assistant entries) is redacted over the whole turn. The tag is matched tolerantly (whitespace, attributes, case, and the HTML-escaped `&lt;private&gt;` spelling; other encodings are not recognised, see the README). The windowed-compile state is updated under the transcript lock so overlapping hooks cannot overwrite each other's dirty marks.
+- The Stop hook POSTed `/compile` after every assistant turn, and the service recompiles the whole date each time. The compile is now windowed per session: a Stop sends it only when it delivered at least one turn and the last successful compile for the session is at least `COMPILE_INTERVAL_MIN` (default 15) minutes old; the SessionEnd hook compiles whatever is still uncompiled. A failed compile leaves its date marked, so the next Stop retries even inside the window, and a date that is still marked when the day changes is compiled too. The state is a small file next to the observation buffers (`<session>.compile.lastturn`, aged out after two weeks). Other clients keep their single trigger at session end. If a session is killed before SessionEnd runs, up to one interval of its last turns waits for the next compile of that date.
+- The wait for a lagging transcript re-read and re-parsed the whole transcript on every poll (about 30 times in 3 seconds). It now parses the file once and then only the bytes appended since (a half-written last line and a split multi-byte character wait for the rest; a file that shrank, or a transcript stored as one JSON document, is read in full again).
+- A last turn whose transcript entry had not landed when its Stop ran stayed pending until a later Stop that might never come. The SessionEnd hook now delivers pending turns (under the same transcript lock) before it builds the session note, then compiles.
+- The Stop-hook documentation no longer says a pending turn is "delivered once": delivery is normally once, and the lock's residual race is documented in 2.9.5.
+
+### Notes
+- A user prompt that has no assistant text and is followed by another prompt (the user interrupted and asked again) is still skipped, on purpose: the conversation compiler needs an answer to compile from, the flush route drops turns without one as noise, and the next prompt carries the intent. A test pins it.
+
 ## [2.9.7] - 2026-11-16
 
 ### Fixed

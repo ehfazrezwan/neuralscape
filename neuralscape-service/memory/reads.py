@@ -5,14 +5,19 @@ code is verbatim — behavior unchanged.
 """
 
 import logging
+import re
+import time
 import uuid
 
 from datetime import datetime, timezone
 from config import settings
 from schemas import ContextResponse, MemoryResponse, MemoryVisibility
 from memory.audit import _audit_log
+from memory.groups import GroupKey, _build_group_id, _encode_group_key, _is_plain_component, decode_group_id
 from memory.hashing import _created_at_key
 from memory.ranking import _mem_is_tombstoned
+
+_LEGACY_PROJECT_TAIL = re.compile(r"(?P<project>.+?)(?:--ws--(?P<workspace>.+))?")
 
 logger = logging.getLogger(__name__)
 
@@ -186,13 +191,19 @@ class ReadsMixin:
         )
 
     def _global_context_filter(self, user_id: str):
-        """Caller's own global-scope rows, tombstones excluded."""
+        """Caller's own global-scope rows, tombstones excluded.
+
+        Memory workspace only (the condition recall's default uses), so a
+        caller's own reference-workspace rows never flood session-start context.
+        """
         from qdrant_client.models import FieldCondition, Filter, MatchValue
+        from memory.search import _workspace_filter
 
         return Filter(
             must=[
                 FieldCondition(key="user_id", match=MatchValue(value=user_id)),
                 FieldCondition(key="metadata.scope", match=MatchValue(value="global")),
+                _workspace_filter(["memory"]),
             ],
             must_not=[self._tombstone_condition()],
         )
@@ -213,10 +224,12 @@ class ReadsMixin:
             MatchExcept,
             MatchValue,
         )
+        from memory.search import _workspace_filter
 
         own = Filter(
             must=[
                 FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+                _workspace_filter(["memory"]),
                 Filter(
                     should=[
                         FieldCondition(
@@ -379,7 +392,10 @@ class ReadsMixin:
         text = str(memory_id).strip()
         if text.isascii() and text.isdigit():
             n = int(text)
-            return n if n < 2**64 else None
+            if n < 2**64:
+                return n
+            # Too large for an unsigned 64-bit id: a 32-digit dashless UUID
+            # made only of decimal digits lands here, so try the UUID parse.
         try:
             return str(uuid.UUID(text))
         except (ValueError, AttributeError, TypeError):
@@ -851,16 +867,161 @@ class ReadsMixin:
             memories = [mem for mem in memories if not _mem_is_tombstoned(mem)]
         return [self._mem_to_response(mem) for mem in memories]
 
+    # Facet / scroll bounds for the vector-derived project list. A deployment
+    # has tens of projects; the caps only guard a pathological collection.
+    _PROJECTS_FACET_LIMIT = 10_000
+    _PROJECTS_SCROLL_PAGE = 1000
+    _PROJECTS_SCROLL_CAP = 100_000
+    _PROJECTS_FACET_RETRY_S = 300.0
+
     def list_projects(self, user_id: str) -> list[str]:
-        """Return the distinct project_ids the caller can scope memory to.
+        """Distinct project_ids the caller can scope memory to (sorted).
+
+        Thin wrapper over :meth:`list_projects_status` for callers that do not
+        surface the degraded marker.
+        """
+        return self.list_projects_status(user_id)["projects"]
+
+    def list_projects_status(self, user_id: str) -> dict:
+        """``{"projects": [...]}`` plus ``degraded``/``error`` on a graph outage.
 
         Projects in Neuralscape are *implicit*: a project "exists" exactly
         when at least one memory has been stored under its ``project_id``.
-        There is no separate project entity to create, update, or delete —
-        ``remember(..., project_id="x")`` brings project ``x`` into being and
-        ``delete_memories(scope="project", project_id="x")`` removes it.
+        There is no separate project entity to create, update, or delete.
 
-        Rather than scanning every memory, this derives the list from Neo4j
+        The **vector store is the source of truth**: every distinct
+        ``metadata.project_id`` among rows the caller may read (own rows plus
+        shared/standard rows, same visibility rule as recall's pools;
+        dream-tombstoned rows excluded; every workspace counts, memory and
+        reference alike). Graph-derived projects (see
+        :meth:`_graph_project_ids`) are merged in so a project that only has
+        graph episodes still appears. A project whose enrichment is pending,
+        or whose graph is off or failing, is therefore still listed.
+
+        A vector-store failure raises (callers map it to a 500); it is never
+        reported as "no projects". When the graph is configured but its query
+        fails, the vector list is returned with ``"degraded": True,
+        "error": "graph_unavailable"`` (same shape as graph search). A graph
+        that is simply not configured adds no marker. ``"truncated": true``
+        means a facet/scroll cap was reached and the list may be incomplete.
+        """
+        projects, truncated = self._vector_project_ids(user_id)
+        graph_projects, degraded = self._graph_project_ids(user_id)
+        projects |= graph_projects
+        out: dict = {"projects": sorted(projects)}
+        if truncated:
+            out["truncated"] = True
+        if degraded:
+            out["degraded"] = True
+            out["error"] = "graph_unavailable"
+        return out
+
+    def _projects_filter(self, user_id: str):
+        """Readable, non-tombstoned rows that carry a project id."""
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        visibility_should = [
+            FieldCondition(key="user_id", match=MatchValue(value=user_id)),
+            FieldCondition(key="metadata.owner_user_id", match=MatchValue(value=user_id)),
+            FieldCondition(
+                key="metadata.visibility",
+                match=MatchValue(value=MemoryVisibility.SHARED.value),
+            ),
+        ]
+        if settings.standards_enabled:
+            visibility_should.append(
+                FieldCondition(
+                    key="metadata.visibility",
+                    match=MatchValue(value=MemoryVisibility.STANDARD.value),
+                )
+            )
+        return Filter(
+            must=[Filter(should=visibility_should)],
+            must_not=[
+                FieldCondition(
+                    key="metadata.dream_tombstoned", match=MatchValue(value=True)
+                )
+            ],
+        )
+
+    def _vector_project_ids(self, user_id: str) -> tuple[set[str], bool]:
+        """Distinct ``metadata.project_id`` of the caller's readable rows.
+
+        Prefers one Qdrant facet (server-side distinct over the keyword index
+        on ``metadata.project_id``, qdrant-client >= 1.12 / server >= 1.12).
+        If the facet is unavailable (older server, index not built yet) it
+        falls back to a payload-only scroll, bounded by
+        ``_PROJECTS_SCROLL_CAP`` points. Raises when neither works. Returns
+        ``(projects, truncated)``; ``truncated`` when a cap was reached. After a
+        facet failure that the scroll survives, the facet is skipped for
+        ``_PROJECTS_FACET_RETRY_S`` so it is not retried on every call.
+        """
+        client = self._get_memory().vector_store.client
+        flt = self._projects_filter(user_id)
+        self._ensure_filter_indexes()
+        if time.monotonic() >= getattr(self, "_projects_facet_retry_at", 0.0):
+            try:
+                resp = client.facet(
+                    collection_name=settings.qdrant_collection,
+                    key="metadata.project_id",
+                    facet_filter=flt,
+                    limit=self._PROJECTS_FACET_LIMIT,
+                    exact=True,
+                )
+                hits = list(getattr(resp, "hits", None) or [])
+                truncated = len(hits) >= self._PROJECTS_FACET_LIMIT
+                if truncated:
+                    logger.warning(
+                        f"list_projects facet hit its {self._PROJECTS_FACET_LIMIT}-value "
+                        "limit; list may be incomplete"
+                    )
+                return (
+                    {
+                        h.value
+                        for h in hits
+                        if isinstance(getattr(h, "value", None), str) and h.value.strip()
+                    },
+                    truncated,
+                )
+            except Exception as e:
+                logger.warning(f"list_projects facet failed ({e}) — falling back to scroll")
+                self._projects_facet_retry_at = time.monotonic() + self._PROJECTS_FACET_RETRY_S
+
+        found: set[str] = set()
+        truncated = False
+        offset = None
+        scanned = 0
+        while scanned < self._PROJECTS_SCROLL_CAP:
+            page, offset = client.scroll(
+                collection_name=settings.qdrant_collection,
+                scroll_filter=flt,
+                limit=self._PROJECTS_SCROLL_PAGE,
+                offset=offset,
+                with_payload=["metadata.project_id"],
+                with_vectors=False,
+            )
+            for p in page or []:
+                meta = (getattr(p, "payload", None) or {}).get("metadata") or {}
+                pid = meta.get("project_id") if isinstance(meta, dict) else None
+                if isinstance(pid, str) and pid.strip():
+                    found.add(pid)
+            scanned += len(page or [])
+            if offset is None:
+                break
+        else:
+            truncated = True
+            logger.warning(
+                f"list_projects scroll hit the {self._PROJECTS_SCROLL_CAP}-point cap; "
+                "list may be incomplete"
+            )
+        return found, truncated
+
+    def _graph_project_ids(self, user_id: str) -> tuple[set[str], bool]:
+        """Projects encoded in Neo4j group ids, and whether the graph failed.
+
+        Returns ``(projects, degraded)``; ``degraded`` is True only when the
+        graph is configured but unavailable (init failed or the query failed).
+        The graph half of the list: derived from Neo4j
         ``group_id`` values with an index-backed ``DISTINCT`` query. Each
         project is encoded in the group_id (``user--{uid}--project--{pid}`` for
         the caller's private projects, ``shared--project--{pid}`` for the
@@ -870,18 +1031,33 @@ class ReadsMixin:
         and the database returns only the distinct group_ids (tens), never the
         underlying memories (potentially many thousands).
 
-        Returns the caller's private projects **plus all team-shared
-        projects** — the picker can scope to a shared project even before the
-        caller has contributed to it. Powers the plugin's `project` selection
-        skill (notably in Claude Cowork, which has no working directory to
-        derive a ``project_id`` from).
+        Covers the caller's private projects plus all team-shared projects.
         """
         g = self._get_graphiti()
         if g is None:
-            return []
+            return set(), bool(getattr(self, "_graph_init_error", None))
 
+        # With the injective flag on, a project group whose owner or project id
+        # needs encoding is named ``nsg1--<hex>`` (see memory/groups.py), which
+        # no ``user--`` prefix seek finds: scan that prefix too and keep only
+        # the groups ``decode_group_id`` places in this caller's private pool or
+        # the shared pool. A non-plain caller id is never used in a legacy
+        # prefix (it could match another user's legacy namespace).
+        injective = settings.graph_group_id_injective_enabled
         user_prefix = f"user--{user_id}--project--"
         shared_prefix = "shared--project--"
+        encoded_prefixes: list[str] = []
+        if injective:
+            # The encoding is field-ordered (pool, owner, project, workspace), so
+            # this caller's private groups and the shared pool each share a stable
+            # hex prefix: seek those, never every user's encoded groups. The
+            # trailing "~" (absent-field) markers are dropped to get the prefix.
+            encoded_prefixes = [
+                _encode_group_key(GroupKey("private", user_id, None, None))[:-len(b"~~".hex())],
+                _encode_group_key(GroupKey("shared", None, None, None))[:-len(b"~~~".hex())],
+            ]
+            if not _is_plain_component(user_id):
+                user_prefix = encoded_prefixes[0]  # never a legacy prefix for a non-plain caller
         # One MATCH per indexed label so the per-label group_id range index is
         # used; UNION dedupes across labels (and is itself DISTINCT).
         cypher = """
@@ -897,12 +1073,20 @@ class ReadsMixin:
         WHERE n.group_id STARTS WITH $user_prefix OR n.group_id STARTS WITH $shared_prefix
         RETURN DISTINCT n.group_id AS group_id
         """
+        if injective:
+            cypher = cypher.replace(
+                "OR n.group_id STARTS WITH $shared_prefix",
+                "OR n.group_id STARTS WITH $shared_prefix"
+                " OR n.group_id STARTS WITH $encoded_private_prefix"
+                " OR n.group_id STARTS WITH $encoded_shared_prefix",
+            )
+        params = {"user_prefix": user_prefix, "shared_prefix": shared_prefix}
+        if injective:
+            params["encoded_private_prefix"], params["encoded_shared_prefix"] = encoded_prefixes
 
         async def _run():
             async with g.driver.session() as session:
-                result = await session.run(
-                    cypher, user_prefix=user_prefix, shared_prefix=shared_prefix
-                )
+                result = await session.run(cypher, **params)
                 return await result.data()
 
         coro = _run()
@@ -913,18 +1097,40 @@ class ReadsMixin:
             # so it doesn't leak / emit "coroutine was never awaited".
             coro.close()
             logger.warning(f"list_projects graph query failed: {e}")
-            return []
+            return set(), True
 
         projects: set[str] = set()
         for rec in records:
             gid = rec.get("group_id") or ""
+            placement = decode_group_id(gid) if injective else None
+            if placement is not None:
+                if placement.project and (
+                    placement.pool == "shared"
+                    or (placement.pool == "private" and placement.owner == user_id)
+                ):
+                    projects.add(placement.project)
+                continue
+            if injective:
+                # Flag on: a legacy name counts only when the builder itself
+                # produces it for exactly this caller (or the shared pool), so a
+                # flag-off-era row of a colliding '--' user is not listed.
+                tail = (
+                    gid[len(user_prefix):] if gid.startswith(user_prefix) and user_prefix.startswith("user--")
+                    else gid[len(shared_prefix):] if gid.startswith(shared_prefix) else None
+                )
+                match = _LEGACY_PROJECT_TAIL.fullmatch(tail) if tail else None
+                if match is not None:
+                    pool, owner = ("private", user_id) if gid.startswith("user--") else ("shared", "")
+                    if gid == _build_group_id(pool, owner, match["project"], match["workspace"]):
+                        projects.add(match["project"])
+                continue
             # Both namespaces end with '--project--{pid}'; everything after the
             # separator is the project id. Global groups ('user--{uid}',
             # 'shared') have no separator and are skipped.
             _, sep, pid = gid.partition("--project--")
             if sep and pid.strip():
                 projects.add(pid)
-        return sorted(projects)
+        return projects, False
 
     def _list_null_category_memories(
         self,

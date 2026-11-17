@@ -9,7 +9,7 @@ import re
 
 from datetime import datetime, timezone
 from config import settings
-from memory.groups import _edge_is_invalidated, _get_group_ids
+from memory.groups import _edge_is_invalidated, _get_group_ids, _scoped_groups
 from memory.junk import _JUNK_RE
 
 logger = logging.getLogger(__name__)
@@ -47,7 +47,9 @@ class GraphAdminMixin:
 
         from graphiti_core.nodes import EntityNode
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
 
         try:
             nodes = self._run_on_bridge(
@@ -124,7 +126,9 @@ class GraphAdminMixin:
         from graphiti_core.edges import EntityEdge
         from graphiti_core.errors import GroupsEdgesNotFoundError
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
 
         try:
             edges = self._run_on_bridge(
@@ -174,7 +178,9 @@ class GraphAdminMixin:
         if not terms:
             return []
         lucene = " OR ".join(terms[:12])
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
         cypher = """
         CALL db.index.fulltext.queryNodes('episode_content', $q) YIELD node, score
         WHERE node.group_id IN $group_ids
@@ -200,6 +206,9 @@ class GraphAdminMixin:
             # No-op for an awaited coroutine; prevents "never awaited"
             # leaks when the bridge is mocked or fails before scheduling.
             coro.close()
+        # A reversible tombstone hides the memory's vector row only: its
+        # episode must not feed ask evidence either.
+        hidden = self._tombstoned_episode_uuids([rec.get("uuid") for rec in records])
         return [
             {
                 "uuid": rec.get("uuid"),
@@ -208,7 +217,7 @@ class GraphAdminMixin:
                 "score": rec.get("score"),
             }
             for rec in records
-            if rec.get("content")
+            if rec.get("content") and rec.get("uuid") not in hidden
         ]
 
     def get_graph_episodes(
@@ -219,7 +228,9 @@ class GraphAdminMixin:
         if g is None:
             return []
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
         now = datetime.now(timezone.utc)
 
         try:
@@ -256,7 +267,9 @@ class GraphAdminMixin:
 
         from graphiti_core.nodes import CommunityNode
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
+        if not group_ids:
+            return []
 
         try:
             communities = self._run_on_bridge(
@@ -286,7 +299,9 @@ class GraphAdminMixin:
             project_id: Optional project scope for authorization.
 
         Returns:
-            Dict with message or error. Raises PermissionError if the episode
+            Dict with message or error (``not_found: True`` alongside the error
+            when no such episode exists, so callers can answer 404 and keep 500
+            for real backend failures). Raises PermissionError if the episode
             is not in the caller's readable group_ids (same pool rules as reads).
         """
         g = self._get_graphiti()
@@ -310,38 +325,148 @@ class GraphAdminMixin:
                 logger.error(f"Failed to delete episode {episode_uuid}: {e}")
                 return {"error": str(e)}
 
-        group_ids = _get_group_ids(user_id, project_id)
+        group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
         try:
             # First verify the episode exists and is in an authorized group
-            async def _check_and_delete():
+            async def _check():
                 async with g.driver.session() as session:
-                    # Check episode exists and belongs to an authorized group
                     check = await session.run(
                         "MATCH (e:Episodic {uuid: $uuid}) RETURN e.group_id AS group_id",
                         uuid=episode_uuid,
                     )
                     records = await check.data()
                     if not records:
-                        return {"error": f"Episode {episode_uuid} not found"}
+                        return {"error": f"Episode {episode_uuid} not found", "not_found": True}
                     ep_group = records[0].get("group_id")
                     if ep_group not in group_ids:
                         raise PermissionError(
                             f"Episode {episode_uuid} belongs to group {ep_group!r}, "
                             f"which is not in the caller's readable groups."
                         )
-                    # Authorized — delete it
-                    await session.run(
-                        "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
-                        uuid=episode_uuid,
-                    )
-                    return {"message": f"Episode {episode_uuid} deleted"}
+                    return {"group_id": ep_group}
 
-            return self._run_on_bridge(_check_and_delete())
+            checked = self._run_on_bridge(_check())
+            if "group_id" not in checked:
+                return checked
+            ep_group = checked["group_id"]
+
+            # Deleting an episode (node, edges, entities) needs the same permission as editing
+            # a memory in that group; nothing is touched before this passes.
+            self._check_episode_delete_permission(episode_uuid, ep_group, user_id)
+
+            # Authorized: run the same cascade a memory delete runs (provenance.py) so the
+            # edges only this episode supports are removed (edges another episode still
+            # supports stay live), its entities are cleaned and the episode node is deleted.
+            cascade = self._cascade_expire_episode(ep_group, episode_uuid=episode_uuid, support_aware=True)
+            result: dict = {"message": f"Episode {episode_uuid} deleted"}
+            if cascade.get("resolved"):
+                result["graph_cascade"] = {
+                    k: cascade[k]
+                    for k in ("edges_expired", "edges_kept", "nodes_removed", "summaries_cleared")
+                    if k in cascade
+                }
+            else:
+                # The cascade did not resolve the episode: only the node is removed here.
+                result["graph_cascade"] = {"resolved": False, "edges_left": True}
+                # Nothing resolved (or the cascade could not run): remove the node itself,
+                # as this endpoint always has.
+                async def _plain_delete():
+                    async with g.driver.session() as session:
+                        await session.run(
+                            "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
+                            uuid=episode_uuid,
+                        )
+
+                self._run_on_bridge(_plain_delete())
+
+            # The memory rows that recorded this episode must not keep pointing at it.
+            # The repair also builds re-enrichment jobs for live siblings; they are dropped
+            # here: the operator removed this fact from the graph on purpose.
+            repair = self._repair_episode_siblings(
+                user_id, {episode_uuid}, set(), deleted_ids=set(), skip_job_ids=set()
+            )
+            if repair.get("clear_failed_ids") or repair.get("lookup_failed"):
+                result["episode_refs_unrepaired"] = list(repair.get("clear_failed_ids") or [])
+                logger.warning(
+                    "Episode %s deleted but memory row references not all cleared: %s",
+                    episode_uuid, repair,
+                )
+            return result
         except PermissionError:
             raise
         except Exception as e:
             logger.error(f"Failed to delete episode {episode_uuid}: {e}")
             return {"error": str(e)}
+
+    def _check_episode_delete_permission(self, episode_uuid: str, ep_group: str, user_id: str) -> None:
+        """Require the permission of editing a memory in the episode's group; raises PermissionError.
+
+        Applies the memory edit rule (``memory.groups._check_edit_permission``): ``standard`` is
+        dictator-only, a private group is its owner's, and a ``shared`` episode may be removed by
+        the owner of every memory row that references it. If those rows cannot be found or
+        read, the delete is refused.
+        """
+        from memory.groups import _build_group_id, _check_edit_permission, decode_group_id
+
+        def _gate(meta: dict, payload_user: str) -> None:
+            _check_edit_permission(
+                meta, payload_user, user_id, edits_content=True, edits_visibility=False
+            )
+
+        # The tier comes from the group's placement: decoded for an injectively encoded name,
+        # the plain-name layout otherwise. Private counts only for the caller's own groups.
+        key = decode_group_id(ep_group)
+        if key is not None:
+            tier, owner = key.pool, key.owner
+        elif ep_group == "standard" or ep_group.startswith("standard--"):
+            tier, owner = "standard", None
+        elif ep_group == "shared" or ep_group.startswith("shared--"):
+            tier, owner = "shared", None
+        else:
+            own = _build_group_id("private", user_id)
+            tier = "private" if ep_group == own or ep_group.startswith(own + "--") else None
+            owner = user_id
+        if tier == "standard":
+            return _gate({"visibility": "standard"}, "")
+        if tier == "private":
+            if owner != user_id:
+                raise PermissionError(f"Episode {episode_uuid} is in another user's private group.")
+            return _gate({"visibility": "private", "owner_user_id": user_id}, user_id)
+        if tier != "shared":
+            raise PermissionError(f"Episode {episode_uuid} is in a group that cannot be classified.")
+        if settings.is_dictator(user_id):
+            return
+        rows = self._episode_survivors(episode_uuid, None, ())
+        if not rows:
+            raise PermissionError(
+                f"Episode {episode_uuid} is in a shared group and its owner cannot be established."
+            )
+        for _, payload in rows:
+            _gate(self._effective_meta(payload)[1], payload.get("user_id", ""))
+
+    def _may_delete_episode(self, episode_uuid: str, user_id: str) -> bool:
+        """Whether a delete of this episode by ``user_id`` would pass the permission gate."""
+        g = self._get_graphiti()
+        if g is None:
+            return True
+
+        async def _group():
+            async with g.driver.session() as session:
+                res = await session.run(
+                    "MATCH (e:Episodic {uuid: $uuid}) RETURN e.group_id AS group_id", uuid=episode_uuid
+                )
+                return await res.data()
+
+        try:
+            rows = self._run_on_bridge(_group())
+            if not rows:
+                return True
+            self._check_episode_delete_permission(episode_uuid, rows[0].get("group_id"), user_id)
+            return True
+        except PermissionError:
+            return False
+        except Exception:
+            return True
 
     def _find_junk_episodes(self, episodes: list[dict]) -> list[dict]:
         """Filter a list of episodes to only those matching junk patterns."""
@@ -387,6 +512,7 @@ class GraphAdminMixin:
         breakdown = {}
         total_junk = 0
         total_deleted = 0
+        all_skipped: list[str] = []
         all_samples = []
 
         for pid in project_ids_to_scan:
@@ -396,40 +522,65 @@ class GraphAdminMixin:
             total_junk += len(junk_episodes)
 
             if dry_run:
+                # Report what a real run would skip separately, so junk_count is what it deletes.
+                would_skip = [ep["uuid"] for ep in junk_episodes if not self._may_delete_episode(ep["uuid"], user_id)]
+                junk_episodes = [ep for ep in junk_episodes if ep["uuid"] not in set(would_skip)]
+                total_junk -= len(would_skip)
                 breakdown[group_label] = {"junk_count": len(junk_episodes)}
+                if would_skip:
+                    breakdown[group_label]["skipped_count"] = len(would_skip)
+                    breakdown[group_label]["skipped_uuids"] = would_skip
+                    all_skipped.extend(would_skip)
                 all_samples.extend(
                     {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
                     for ep in junk_episodes[:5]
                 )
             else:
                 deleted_uuids = []
+                skipped_uuids = []
                 for ep in junk_episodes:
-                    result = self.delete_episode(ep["uuid"], user_id=user_id, project_id=pid)
+                    try:
+                        result = self.delete_episode(ep["uuid"], user_id=user_id, project_id=pid)
+                    except PermissionError:
+                        skipped_uuids.append(ep["uuid"])  # not the caller's to delete: skip, keep going
+                        continue
                     if "error" not in result:
                         deleted_uuids.append(ep["uuid"])
                 breakdown[group_label] = {
                     "deleted_count": len(deleted_uuids),
                     "deleted_uuids": deleted_uuids,
                 }
+                if skipped_uuids:
+                    breakdown[group_label]["skipped_count"] = len(skipped_uuids)
+                    breakdown[group_label]["skipped_uuids"] = skipped_uuids
                 total_deleted += len(deleted_uuids)
+                all_skipped.extend(skipped_uuids)
                 all_samples.extend(
                     {"uuid": ep["uuid"], "group": group_label, "content": ep["content"][:120]}
                     for ep in junk_episodes[:3]
                 )
 
         if dry_run:
-            return {
+            out = {
                 "dry_run": True,
                 "junk_count": total_junk,
                 "breakdown": breakdown,
                 "samples": all_samples[:15],
             }
+            if all_skipped:
+                out["skipped_count"] = len(all_skipped)
+                out["skipped_uuids"] = all_skipped
+            return out
 
-        return {
+        out = {
             "deleted_count": total_deleted,
             "breakdown": breakdown,
             "samples": all_samples[:15],
         }
+        if all_skipped:
+            out["skipped_count"] = len(all_skipped)
+            out["skipped_uuids"] = all_skipped
+        return out
 
     def rebuild_graph_from_vectors(
         self,
@@ -593,10 +744,10 @@ class GraphAdminMixin:
                 break
 
             for point in points:
-                scanned += 1
-                if max_rows and scanned > max_rows:
+                if max_rows and scanned >= max_rows:
                     logger.info(f"Hit max_rows cap ({max_rows}), stopping")
                     break
+                scanned += 1
 
                 try:
                     # Extract fields from the Qdrant point payload

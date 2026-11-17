@@ -3,9 +3,11 @@
 Seeds RELATES_TO edges directly in Neo4j (no LLM), tombstones through the
 production ``supersede_contradicted_rows`` against a real Qdrant client
 (in-process local mode, no server needed), and checks the real recall filter.
-What it proves is the part unit fakes cannot: the two Cypher statements'
-predicates (``invalid_at`` / ``expired_at`` window, ``NOT new_episode IN
-episodes``, live-edge counting) behave on a real graph, flag ON.
+What it proves is the part unit fakes cannot: the Cypher statements'
+predicates (the probing episode's own ``entity_edges`` list, the ``invalid_at`` /
+``expired_at`` window, the other-episode check, live-edge counting) behave on a
+real graph, flag ON. Episodes are seeded as ``Episodic`` nodes with the
+``entity_edges`` list Graphiti stores (edges the episode resolved and invalidated).
 
 The LLM-driven half (Graphiti's ``add_episode`` actually invalidating the
 edge) needs a Gemini key and is covered by the flag-on VPS integration run.
@@ -14,11 +16,12 @@ Lives outside ``tests/`` (like ``test_native_snapshot_neo4j.py``) so the
 default host/container suites never see it; invoke explicitly with a live
 Neo4j: ``NEO4J_URI=... NEO4J_USER=... NEO4J_PASSWORD=... [NEO4J_DATABASE=neo4j]
 uv run pytest integration_tests/test_contradiction_supersession_neo4j.py -v``.
-A missing or unreachable database is a test failure, not a skip.
+Connection comes from the shared ``neo4j_conn`` fixture in ``conftest.py``: an
+unreachable database skips (or fails on the integration gate), it never breaks
+collection.
 """
 
 import asyncio
-import os
 import uuid
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
@@ -27,26 +30,22 @@ import pytest
 
 from config import settings
 
-NEO4J_URI = os.environ["NEO4J_URI"]
-NEO4J_USER = os.environ["NEO4J_USER"]
-NEO4J_PASSWORD = os.environ["NEO4J_PASSWORD"]
-NEO4J_DB = os.environ.get("NEO4J_DATABASE", "neo4j")
-
 pytestmark = pytest.mark.integration
 
 
 class _DbDriver:
     """Adapt a neo4j AsyncDriver so ``.session()`` targets the configured db."""
 
-    def __init__(self, driver):
+    def __init__(self, driver, database):
         self._d = driver
+        self._db = database
 
     def session(self):
-        return self._d.session(database=NEO4J_DB)
+        return self._d.session(database=self._db)
 
 
 @pytest.fixture
-def graph_env(monkeypatch):
+def graph_env(monkeypatch, neo4j_conn):
     from neo4j import AsyncGraphDatabase
     from qdrant_client import QdrantClient, models
 
@@ -55,7 +54,9 @@ def graph_env(monkeypatch):
     monkeypatch.setattr(settings, "graph_supersession_enabled", True)
     group = f"it-supersede-{uuid.uuid4().hex[:8]}"
     loop = asyncio.new_event_loop()
-    driver = AsyncGraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver = AsyncGraphDatabase.driver(
+        neo4j_conn.uri, auth=(neo4j_conn.user, neo4j_conn.password)
+    )
 
     qdrant = QdrantClient(":memory:")
     collection = f"it_{uuid.uuid4().hex[:8]}"
@@ -68,7 +69,7 @@ def graph_env(monkeypatch):
     svc._memory = MagicMock()
     svc._memory.vector_store.client = qdrant
     svc._graphiti = MagicMock()
-    svc._graphiti.driver = _DbDriver(driver)
+    svc._graphiti.driver = _DbDriver(driver, neo4j_conn.database)
     svc._bridge = MagicMock()
     svc._run_on_bridge = lambda coro, timeout=None: loop.run_until_complete(coro)
 
@@ -89,15 +90,27 @@ def graph_env(monkeypatch):
         loop.close()
 
 
-def _seed_edge(cypher, group, uid, fact, episodes, *, invalid=False, expired=False, when=None):
+def _seed_edge(cypher, group, uid, fact, episodes, *, invalid=False, expired=False, when=None,
+               valid_at=None):
     when = when or datetime.now(timezone.utc)
     cypher(
         "MERGE (a:IntegrationSupersede {group_id:$g, name:'a'}) "
         "MERGE (b:IntegrationSupersede {group_id:$g, name:'b'}) "
         "CREATE (a)-[r:RELATES_TO {uuid:$u, group_id:$g, fact:$f, episodes:$eps}]->(b) "
         "FOREACH (_ IN CASE WHEN $inv THEN [1] ELSE [] END | SET r.invalid_at = datetime($w)) "
-        "FOREACH (_ IN CASE WHEN $exp THEN [1] ELSE [] END | SET r.expired_at = datetime($w))",
+        "FOREACH (_ IN CASE WHEN $exp THEN [1] ELSE [] END | SET r.expired_at = datetime($w)) "
+        "FOREACH (_ IN CASE WHEN $va IS NOT NULL THEN [1] ELSE [] END | SET r.valid_at = datetime($va))",
         g=group, u=uid, f=fact, eps=episodes, inv=invalid, exp=expired, w=when.isoformat(),
+        va=valid_at.isoformat() if valid_at else None,
+    )
+
+
+def _seed_episode(cypher, group, uid, entity_edges):
+    """An ``Episodic`` node as Graphiti stores it: ``entity_edges`` lists the edges the
+    episode resolved and the edges it invalidated."""
+    cypher(
+        "CREATE (:Episodic:IntegrationSupersede {uuid:$u, group_id:$g, entity_edges:$ee})",
+        u=uid, g=group, ee=entity_edges,
     )
 
 
@@ -132,12 +145,15 @@ def test_real_cypher_supersedes_fully_invalidated_single_row_only(graph_env):
     _row(qdrant, collection, old_full, "u1", "ep-full")
     _row(qdrant, collection, old_partial, "u1", "ep-partial")
     _row(qdrant, collection, new, "u1", "ep-new")
-    _seed_edge(cypher, group, "e-full", "Berlin", ["ep-full"], invalid=True, expired=True)
+    # Graphiti appends the new episode to an old edge it dedups onto, then
+    # invalidates it: the contradicted edge cites [old, new].
+    _seed_edge(cypher, group, "e-full", "Berlin", ["ep-full", "ep-new"], invalid=True, expired=True)
     _seed_edge(cypher, group, "e-p1", "Berlin2", ["ep-partial"], invalid=True, expired=True)
     _seed_edge(cypher, group, "e-p2", "Acme", ["ep-partial"])  # still live
     # new episode's own born-expired edge and a delete-cascade edge: not contradictions
     _seed_edge(cypher, group, "e-own", "Paris", ["ep-new"], invalid=True, expired=True)
     _seed_edge(cypher, group, "e-cascade", "x", ["ep-cascade"], expired=True)
+    _seed_episode(cypher, group, "ep-new", ["e-full", "e-p1", "e-own"])
 
     done = supersede_contradicted_rows(
         svc, group_id=group, owner_user_id="u1", write_started_at=start,
@@ -159,6 +175,7 @@ def test_real_cypher_window_excludes_edges_invalidated_before_the_write(graph_en
     _row(qdrant, collection, pid, "u1", "ep-old")
     _seed_edge(cypher, group, "e-old", "Berlin", ["ep-old"], invalid=True, expired=True,
                when=datetime.now(timezone.utc) - timedelta(days=1))
+    _seed_episode(cypher, group, "ep-new", ["e-old"])
 
     done = supersede_contradicted_rows(
         svc, group_id=group, owner_user_id="u1",
@@ -178,6 +195,7 @@ def test_real_filter_hides_superseded_row_from_recall(graph_env):
     _row(qdrant, collection, old, "u1", "ep-old")
     _row(qdrant, collection, new, "u1", "ep-new")
     _seed_edge(cypher, group, "e1", "Berlin", ["ep-old"], invalid=True, expired=True)
+    _seed_episode(cypher, group, "ep-new", ["e1"])
     supersede_contradicted_rows(
         svc, group_id=group, owner_user_id="u1",
         write_started_at=datetime.now(timezone.utc) - timedelta(seconds=1),
@@ -234,3 +252,77 @@ def test_stale_check_episode_with_no_edges_is_current(graph_env):
     counts, stale = _stale_case(graph_env, [])
     assert counts == {"total": 0, "live": 0}
     assert stale is False
+
+
+def test_live_edge_facts_and_dominance_on_the_one_fact_two_edges_shape(graph_env):
+    """Gate shape: one episode yields a residence edge (now invalidated) and an
+    incidental edge (still live). Real Cypher must report the live fact, and the
+    probe must still find the dead edge by its single episode."""
+    from extensions.dreaming.graph_patcher import find_contradicted_edges, live_edge_facts_by_episode
+
+    svc, qdrant, collection, group, cypher = graph_env
+    start = datetime.now(timezone.utc) - timedelta(seconds=1)
+    _seed_edge(cypher, group, "g-dead", "Alice resides in the city of Paris.", ["ep-one"],
+               invalid=True, expired=True)
+    _seed_edge(cypher, group, "g-live", "Paris is a city situated in France.", ["ep-one"])
+    _seed_episode(cypher, group, "ep-new", ["g-dead"])
+
+    live = svc._run_on_bridge(
+        live_edge_facts_by_episode(svc._graphiti.driver, group_id=group, episode_uuids=["ep-one", "ep-none"]))
+    assert live == {"ep-one": ["Paris is a city situated in France."], "ep-none": []}
+    dead = svc._run_on_bridge(
+        find_contradicted_edges(svc._graphiti.driver, group_id=group, write_started_at=start,
+                                new_episode_uuid="ep-new"))
+    assert [(e["uuid"], e["episodes"]) for e in dead] == [("g-dead", ["ep-one"])]
+
+
+def test_concurrent_writes_sharing_an_occurred_at_supersede_only_the_right_row(graph_env):
+    """Three enrichments of one group run at once and share one ``occurred_at``, so every
+    ``valid_at`` is the same instant. Write X contradicts an older fact; write Y has only
+    a born-expired edge of its own; write Z is unrelated and invalidated nothing. Each
+    one's probe runs while the others' edges sit in its time window.
+
+    The newer fact stays live, the older one is superseded by the newer memory, and
+    neither the born-expired write's row nor the unrelated one is tombstoned."""
+    from memory.supersession import supersede_contradicted_rows
+
+    svc, qdrant, collection, group, cypher = graph_env
+    start = datetime.now(timezone.utc) - timedelta(seconds=1)
+    shared = datetime.now(timezone.utc)  # the occurred_at all three writes share
+    old, x_row, y_row, z_row = (str(uuid.uuid4()) for _ in range(4))
+    _row(qdrant, collection, old, "u1", "ep-old")
+    _row(qdrant, collection, x_row, "u1", "ep-x")
+    _row(qdrant, collection, y_row, "u1", "ep-y")
+    _row(qdrant, collection, z_row, "u1", "ep-z")
+    # X: its new edge invalidated the older fact (invalid_at == X's valid_at == shared)
+    _seed_edge(cypher, group, "e-old", "Berlin", ["ep-old", "ep-x"], invalid=True, expired=True,
+               when=shared, valid_at=shared - timedelta(days=30))
+    _seed_edge(cypher, group, "e-x", "London", ["ep-x"], valid_at=shared)
+    # Y: born expired by a later edge of its own, same shared instant, cites only itself
+    _seed_edge(cypher, group, "e-y-dead", "Rome", ["ep-y"], invalid=True, expired=True,
+               when=shared, valid_at=shared)
+    _seed_edge(cypher, group, "e-y", "Milan", ["ep-y"], valid_at=shared)
+    # Z: a dated live edge at the same instant, nothing invalidated
+    _seed_edge(cypher, group, "e-z", "Tea", ["ep-z"], valid_at=shared)
+    _seed_episode(cypher, group, "ep-x", ["e-old", "e-x"])
+    _seed_episode(cypher, group, "ep-y", ["e-y-dead", "e-y"])
+    _seed_episode(cypher, group, "ep-z", ["e-z"])
+
+    for episode, memory in (("ep-y", y_row), ("ep-z", z_row)):
+        done = supersede_contradicted_rows(
+            svc, group_id=group, owner_user_id="u1", write_started_at=start,
+            new_episode_uuid=episode, new_memory_ids={memory}, superseded_by=memory,
+        )
+        assert done == [], episode
+        assert not _meta(qdrant, collection, old).get("dream_tombstoned"), episode
+
+    done = supersede_contradicted_rows(
+        svc, group_id=group, owner_user_id="u1", write_started_at=start,
+        new_episode_uuid="ep-x", new_memory_ids={x_row}, superseded_by=x_row,
+    )
+
+    assert done == [old]
+    assert _meta(qdrant, collection, old)["dream_tombstoned"] is True
+    assert _meta(qdrant, collection, old)["superseded_by"] == x_row
+    for live in (x_row, y_row, z_row):
+        assert not _meta(qdrant, collection, live).get("dream_tombstoned")
