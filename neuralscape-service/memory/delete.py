@@ -23,6 +23,111 @@ from memory.ranking import _mem_is_tombstoned, _times_derived_from_metadata
 logger = logging.getLogger(__name__)
 
 
+def semantic_dedup_phase_enabled() -> bool:
+    """Whether dedup's semantic phase (phase 2) may run for the dedup cron and post-compile dedup.
+
+    With dreaming on, the dream sweep's MERGE action owns near-duplicate merges,
+    so the LOSSY phase (hard delete) is skipped. With
+    ``DEDUP_SEMANTIC_TOMBSTONE_ENABLED`` phase 2 is not lossy (it only tombstones:
+    reversible, nothing deleted, nothing cascaded), so an operator who opted in
+    gets it whether or not dreaming is on. Two guards keep it off the sweep's
+    rows: ``dedup_memories`` holds a pool's dream lock for as long as it works on
+    that pool's rows (whenever Redis answers; it skips the pool if it cannot take
+    it and re-verifies ownership before every write), and the sweep's
+    ``apply_actions`` skips any action whose rows were tombstoned after staging.
+    """
+    from extensions.dreaming.config import dreaming_settings
+
+    return (not dreaming_settings.enabled) or bool(settings.dedup_semantic_tombstone_enabled)
+
+
+# Sentinel: no dream-pool lock is held by the caller, so no neighbour pool check.
+_NO_POOL_GUARD: str = "\0no-pool-guard"
+# Expiry of the dream lock dedup holds while it works on one page of a pool's rows:
+# long enough for a page of vector searches, short enough that a crashed run frees
+# the pool for the sweep quickly.
+_DEDUP_LOCK_TTL_MS = 10 * 60 * 1000
+
+
+class _PoolLockLost(Exception):
+    """The dream lock of ``pool`` is no longer ours: stop writing in that pool."""
+
+    def __init__(self, pool: str):
+        super().__init__(pool)
+        self.pool = pool
+
+
+class _DedupLocks:
+    """The pool locks one dedup run holds: lazy Redis probe, tokens, ownership checks.
+
+    ``redis()`` probes Redis lazily (a pass with no duplicates never calls it). A
+    probe that succeeded is kept for the run; a probe that FAILED is not: the next
+    call probes again, so Redis coming back mid-run takes effect at the next page
+    or duplicate group. ``require(*pools)`` is the check run before every delete or
+    tombstone: for each pool one compare-and-renew round trip that raises
+    ``_PoolLockLost`` when the lock is no longer this run's (expired and taken by a
+    sweep, or Redis failing), and also when this run holds no lock for that pool at
+    all (a write in a pool it never locked is refused, never passed silently).
+    """
+
+    def __init__(self, service):
+        self._service = service
+        self._client = None
+        self._tokens: dict[str, str] = {}
+
+    def redis(self):
+        if self._client is None:
+            self._client = self._service._dream_lock_client()
+        return self._client
+
+    def acquire(self, pool: str) -> str | None:
+        from extensions.dreaming import gate
+
+        token = gate.acquire_lock(self._client, pool, ttl_ms=_DEDUP_LOCK_TTL_MS)
+        if token is not None:
+            self._tokens[pool] = token
+        return token
+
+    def require(self, *pools: str | None) -> None:
+        from extensions.dreaming import gate
+
+        for pool in sorted({p for p in pools if p is not None}):  # None: a tier the sweep never touches
+            token = self._tokens.get(pool)
+            if token is None or not gate.refresh_lock(
+                self._client, pool, token, ttl_ms=_DEDUP_LOCK_TTL_MS
+            ):
+                raise _PoolLockLost(pool)
+
+    def release(self, pool: str) -> None:
+        from extensions.dreaming import gate
+
+        token = self._tokens.pop(pool, None)
+        if token is not None:
+            gate.release_lock(self._client, pool, token)
+
+
+def _dream_pool_of(payload: dict) -> str | None:
+    """The dream-sweep pool a raw row belongs to (None for tiers the sweep never touches).
+
+    Same derivation as ``consolidate.enumerate_pools``, so the key matches the
+    one the sweep locks.
+    """
+    from extensions.dreaming.consolidate import pool_key
+
+    meta, _ = _dedup_meta(payload)
+    visibility = meta.get("visibility") or "private"
+    if visibility == "standard":
+        return None  # authoritative tier: read-only to dreaming, never swept
+    shared = visibility == "shared"
+    owner = meta.get("owner_user_id") or payload.get("user_id")
+    return pool_key(
+        visibility="shared" if shared else "private",
+        owner_user_id=None if shared else owner,
+        project_id=meta.get("project_id"),
+        workspace=meta.get("workspace"),
+    )
+
+
 # Bulk-delete listing page and the cap on listing rounds: a filtered sweep keeps
 # re-listing (deleted rows drop out of the next listing) until nothing new is
 # left; if rows remain unseen when the cap is hit the result says ``truncated``.
@@ -943,6 +1048,48 @@ class DeleteMixin:
             except Exception as e:
                 logger.warning(f"Graph cleanup failed for {memory_id} (non-critical): {e}")
 
+    @staticmethod
+    def _dreaming_enabled() -> bool:
+        from extensions.dreaming.config import dreaming_settings
+
+        return bool(dreaming_settings.enabled)
+
+    @staticmethod
+    def _dream_lock_client():
+        """A Redis client that answers, or None (the caller decides what that means)."""
+        try:
+            from extensions.dreaming.sweep import _get_redis
+
+            client = _get_redis()
+            client.ping()
+            return client
+        except Exception:
+            logger.warning(
+                "dream lock unavailable (Redis unreachable): dedup cannot take a pool lock",
+                exc_info=True,
+            )
+            return None
+
+    def _live_rows(self, rows: list[dict]) -> list[dict]:
+        """The rows of ``rows`` as they are NOW: fresh payloads, minus gone/tombstoned ones.
+
+        A fresh Qdrant read. Callers use the returned rows for every decision and
+        write after taking a lock, never the page copies they read before it (a
+        sweep merge in between changes counters and text on those rows).
+        """
+        points = self._memory.vector_store.client.retrieve(
+            collection_name=settings.qdrant_collection,
+            ids=[r["id"] for r in rows],
+            with_payload=True,
+            with_vectors=False,
+        )
+        fresh = {str(pt.id): (getattr(pt, "payload", None) or {}) for pt in points or []}
+        return [
+            {"id": r["id"], "payload": fresh[r["id"]]}
+            for r in rows
+            if r["id"] in fresh and not _is_tombstoned(fresh[r["id"]])
+        ]
+
     def dedup_memories(self, user_id: str, *, semantic: bool = True) -> dict:
         """Remove duplicate memories for a user in two phases.
 
@@ -956,6 +1103,29 @@ class DeleteMixin:
         Both phases share one partition rule (``_dedup_partition``): a row is
         only ever deleted as a duplicate of a row with the same user, scope,
         project_id, visibility and workspace.
+
+        Both phases take the dream sweep's pool lock (``dreaming:lock:{pool}``)
+        for the rows they delete or tombstone, whenever Redis answers (dreaming
+        on or off: a forced sweep runs with dreaming off). A pool whose lock is
+        held elsewhere is skipped and counted; rows are re-read after the lock
+        is taken and only those fresh rows are used; the lock's ownership is
+        verified (and its expiry renewed) before every delete or tombstone. In
+        the semantic phase a pool whose lock was lost is abandoned for the rest
+        of the run and counted in ``lock_lost_pools``; in the exact phase the
+        group is abandoned with no further write (later groups of that pool try
+        the lock again, and a row that changed pool is counted in
+        ``lock_lost_pools``). A duplicate group spanning several pools verifies
+        and renews ALL of its pools' locks before each delete, and re-reads its
+        survivor (live, same key, same pool) as well: a group that fails either
+        check is abandoned with no further write. Redis unreachable: nothing
+        destructive runs for a pool that has a dream lock (dreaming rows) or a
+        semantic page, whatever the dreaming setting (a sweep that took its
+        lock before the failed probe may still be running); standard-tier exact
+        groups, which no sweep touches, still run. A failed probe is not
+        remembered, Redis is asked again for every duplicate group and every
+        phase-2 page; while it does not answer, the exact group is skipped
+        (counted in ``exact_groups_abandoned``) and the phase-2 page is skipped
+        (counted in ``semantic_skipped``).
 
         ``semantic=False`` skips phase 2. The dreaming sweep's MERGE action
         supersedes it when ``DREAMING_ENABLED=true``: where this phase
@@ -975,7 +1145,11 @@ class DeleteMixin:
 
         Returns:
             Dict with user_id, exact_duplicates_removed, semantic_duplicates_removed,
-            total_checked.
+            total_checked, plus ``exact_skipped_locked_pools`` /
+            ``semantic_skipped_locked_pools`` / ``lock_lost_pools`` (counts),
+            ``exact_groups_abandoned`` (survivor changed under the lock, or Redis did not
+            answer) and ``lock_store_unreachable_skipped`` (exact groups plus semantic pages
+            skipped because Redis did not answer; the only Redis-down counter).
         """
         m = self._get_memory()
         threshold = settings.dedup_similarity_threshold
@@ -983,6 +1157,23 @@ class DeleteMixin:
 
         deleted_ids: set[str] = set()
         collector: dict = {}
+        locks = _DedupLocks(self)
+        exact_locked: set[str] = set()
+        semantic_locked: set[str] = set()
+        lock_lost: set[str] = set()
+        # groups dropped because their survivor changed under the lock, or Redis did not answer
+        exact_abandoned = 0
+        semantic_pages_unlocked_skipped = 0  # pages skipped: Redis did not answer
+        lock_store_skipped = 0  # exact groups + semantic pages skipped: Redis did not answer
+
+        def lock_fields() -> dict:
+            return {
+                "exact_skipped_locked_pools": len(exact_locked),
+                "semantic_skipped_locked_pools": len(semantic_locked),
+                "lock_lost_pools": len(lock_lost),
+                "exact_groups_abandoned": exact_abandoned,
+                "lock_store_unreachable_skipped": lock_store_skipped,
+            }
 
         # The pool is streamed page by page; nothing below holds all of it.
         # Tombstoned rows (dreaming or an earlier semantic merge) are already
@@ -1019,73 +1210,217 @@ class DeleteMixin:
                         hash_groups.setdefault(key, []).append(mem)
         del key_counts
 
-        for h, group in hash_groups.items():
+        for key, group in hash_groups.items():
             if len(group) < 2:
-                continue
-            # Sort by created_at descending — keep the first (newest)
-            group.sort(
-                key=lambda x: x["payload"].get("created_at", ""),
-                reverse=True,
-            )
-            survivor = group[0]
-            # Reinforcement-aware dedup: each dropped duplicate is a repeated
-            # observation of the same fact. The survivor absorbs the counters
-            # of every row it replaces (sum semantics — a dropped row may
-            # itself have accumulated write-path reinforcements).
-            reinforcement = 0
-            for dup in group[1:]:
-                mid = dup["id"]
-                if mid in deleted_ids:
-                    continue
+                continue  # a page without a duplicate group never touches Redis
+            # The group's rows may belong to more than one dream pool (the
+            # partition ignores ``owner_user_id``); lock each without waiting
+            # (a try-lock, so the order cannot deadlock; it only keeps the
+            # acquisitions reproducible). A pool held elsewhere is mid-sweep:
+            # skip the group.
+            pools = sorted({p for p in (_dream_pool_of(r["payload"]) for r in group) if p})
+            held: list[str] = []
+            try:
+                if pools:
+                    if locks.redis() is None:
+                        # Redis does not answer: a sweep that took its lock before
+                        # the failed probe may still be running, so a delete here
+                        # could remove the last live copy. Nothing runs unlocked.
+                        exact_abandoned += 1
+                        lock_store_skipped += 1
+                        continue
+                    busy = []
+                    for p in pools:
+                        if locks.acquire(p) is None:
+                            busy.append(p)
+                        else:
+                            held.append(p)
+                    if busy:
+                        exact_locked.update(busy)
+                        continue
+                    # What the group is now: the rows may have been merged,
+                    # rewritten or tombstoned by a sweep since they were read.
+                    # Only rows still carrying this hash in this partition are
+                    # exact duplicates; the fresh rows are the only ones used.
+                    group = [r for r in self._live_rows(group) if self._exact_key(r) == key]
+                    if len(group) < 2:
+                        continue
+                # Sort by created_at descending — keep the first (newest)
+                group.sort(
+                    key=lambda x: x["payload"].get("created_at", ""),
+                    reverse=True,
+                )
+                survivor = group[0]
+                # Reinforcement-aware dedup: each dropped duplicate is a repeated
+                # observation of the same fact. The survivor absorbs the counters
+                # of every row it replaces (sum semantics — a dropped row may
+                # itself have accumulated write-path reinforcements). The counter
+                # is a write in the survivor's pool: it is made only while that
+                # lock is still ours (a group that lost a lock or its survivor
+                # writes nothing more, so that group's tick is dropped).
+                reinforcement = 0
                 try:
-                    self._delete_qdrant_memory_with_graph_cleanup(mid, dup["payload"], collector=collector)
-                    deleted_ids.add(mid)
-                    exact_removed += 1
-                    reinforcement += _times_derived_from_metadata(
-                        dup["payload"].get("metadata")
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to delete exact dup {mid}: {e}")
-            if reinforcement:
-                self._bump_times_derived(survivor["id"], reinforcement)
+                    for dup in group[1:]:
+                        mid = dup["id"]
+                        if mid in deleted_ids:
+                            continue
+                        if held:
+                            # Before every delete: the locks of ALL the group's
+                            # pools (this row's and the survivor's) are still
+                            # ours (and renewed), and the survivor is still a
+                            # live row of this group. A group that fails either
+                            # check is abandoned with no further write.
+                            locks.require(
+                                _dream_pool_of(dup["payload"]),
+                                _dream_pool_of(survivor["payload"]),
+                                *held,
+                            )
+                            live = self._live_rows([survivor])
+                            if not live or self._exact_key(live[0]) != key:
+                                exact_abandoned += 1
+                                reinforcement = 0  # no write in favour of a changed survivor
+                                break
+                            # The re-read survivor is the one the rest of the group
+                            # uses; if its pool changed (e.g. its owner), that pool's
+                            # lock must be ours too, or the group is abandoned.
+                            fresh_pool = _dream_pool_of(live[0]["payload"])
+                            if fresh_pool != _dream_pool_of(survivor["payload"]):
+                                locks.require(fresh_pool)
+                            survivor = live[0]
+                        try:
+                            self._delete_qdrant_memory_with_graph_cleanup(
+                                mid, dup["payload"], collector=collector
+                            )
+                            deleted_ids.add(mid)
+                            exact_removed += 1
+                            reinforcement += _times_derived_from_metadata(
+                                dup["payload"].get("metadata")
+                            )
+                        except Exception as e:
+                            logger.warning(f"Failed to delete exact dup {mid}: {e}")
+                    if reinforcement:
+                        # (The survivor was re-read before the last delete; an owner
+                        # change after that is not seen. Not reachable today:
+                        # owner_user_id is written only when a row is created.)
+                        if held:
+                            locks.require(_dream_pool_of(survivor["payload"]))
+                        self._bump_times_derived(survivor["id"], reinforcement)
+                except _PoolLockLost as lost:
+                    lock_lost.add(lost.pool)
+            finally:
+                for p in held:
+                    locks.release(p)
         del hash_groups
 
         # ── Phase 2: Semantic dedup ──
         semantic_removed = 0
         if not semantic:
+            logger.info(
+                "dedup run user=%s scanned=%d exact_removed=%d semantic=skipped "
+                "(caller skipped the semantic phase) exact_skipped_locked_pools=%d "
+                "lock_lost_pools=%d exact_groups_abandoned=%d lock_store_unreachable_skipped=%d",
+                user_id, total_checked, exact_removed, len(exact_locked), len(lock_lost),
+                exact_abandoned, lock_store_skipped,
+            )
             return {
                 "user_id": user_id,
                 "exact_duplicates_removed": exact_removed,
                 "semantic_duplicates_removed": 0,
                 "semantic_skipped": "superseded by dreaming MERGE",
                 "total_checked": total_checked,
+                **lock_fields(),
                 **self._dedup_graph_summary(collector, deleted_ids),
             }
 
         # One page at a time, so stored vectors are held for at most
         # ``batch_size`` rows (a full user pool of 768-d vectors would not fit).
+        # The phase HOLDS the dream lock of each pool for the time it works on
+        # that pool's rows (the sweep's own key, non-blocking), whenever Redis
+        # answers: a pool whose lock it cannot take is mid-sweep and is skipped
+        # this run (reported, the next run picks it up). Redis is asked again for
+        # every page while it has not answered: a page that cannot take its lock is
+        # skipped and counted, never run unlocked, whatever the dreaming setting (a
+        # sweep, forced or scheduled, may have taken its lock before the failed
+        # probe), and the next page tries again.
         for page in self._iter_user_memory_pages(user_id, batch_size):
+            # Probed again for every page while the last probe failed: Redis
+            # coming back mid-run is picked up at the next page.
+            lock_redis = locks.redis()
+            if lock_redis is None:
+                semantic_pages_unlocked_skipped += 1
+                lock_store_skipped += 1
+                continue
             chunk = [
                 mem for mem in page
                 if mem["id"] not in deleted_ids and not _is_tombstoned(mem["payload"])
             ]
             if not chunk:
                 continue
-            stored_vectors = self._fetch_dense_vectors([mem["id"] for mem in chunk])
+            groups: dict[str | None, list[dict]] = {}
             for mem in chunk:
-                semantic_removed += self._semantic_dedup_one(
-                    m, user_id, mem, stored_vectors.get(mem["id"]), threshold, deleted_ids,
-                    collector=collector,
-                )
+                pool = _dream_pool_of(mem["payload"])
+                groups.setdefault(pool, []).append(mem)
+            for pool, rows in groups.items():
+                if pool is not None and pool in lock_lost:
+                    continue  # lock lost earlier in this run: no more work in this pool
+                token = None
+                if pool is not None:
+                    token = locks.acquire(pool)  # also renews the expiry for this page
+                    if token is None:
+                        semantic_locked.add(pool)
+                        continue
+                try:
+                    if token is not None:
+                        # Rows may have been tombstoned or merged by a sweep that
+                        # ran between reading the page and taking the lock: from
+                        # here on only the fresh rows are used.
+                        rows = self._live_rows(rows)
+                        if not rows:
+                            continue
+                    stored_vectors = self._fetch_dense_vectors([mem["id"] for mem in rows])
+                    for mem in rows:
+                        semantic_removed += self._semantic_dedup_one(
+                            m, user_id, mem, stored_vectors.get(mem["id"]), threshold,
+                            deleted_ids, collector=collector,
+                            held_pool=pool,
+                            lock_guard=(lambda p=pool: locks.require(p)) if token else None,
+                        )
+                except _PoolLockLost as lost:
+                    lock_lost.add(lost.pool)
+                finally:
+                    if token is not None:
+                        locks.release(pool)
 
-        return {
+        logger.info(
+            "dedup run user=%s scanned=%d exact_removed=%d semantic_pairs_merged=%d "
+            "semantic_mode=%s threshold=%s exact_skipped_locked_pools=%d "
+            "semantic_skipped_locked_pools=%d lock_lost_pools=%d "
+            "exact_groups_abandoned=%d lock_store_unreachable_skipped=%d",
+            user_id, total_checked, exact_removed, semantic_removed,
+            "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete", threshold,
+            len(exact_locked), len(semantic_locked), len(lock_lost),
+            exact_abandoned, lock_store_skipped,
+        )
+        result = {
             "user_id": user_id,
             "exact_duplicates_removed": exact_removed,
             "semantic_duplicates_removed": semantic_removed,
             "semantic_mode": "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete",
             "total_checked": total_checked,
+            **lock_fields(),
             **self._dedup_graph_summary(collector, deleted_ids),
         }
+        if semantic_pages_unlocked_skipped:
+            result["semantic_skipped"] = (
+                f"dream lock unavailable (Redis) for {semantic_pages_unlocked_skipped} page(s)"
+            )
+        return result
+
+    @staticmethod
+    def _exact_key(row: dict) -> tuple:
+        """The exact phase's group key for a (fresh) row: hash, partition, category."""
+        payload = row["payload"]
+        return (payload.get("hash"), _dedup_partition(payload), _exact_category(payload))
 
     @staticmethod
     def _dedup_graph_summary(collector: dict, deleted_ids: set[str]) -> dict:
@@ -1111,8 +1446,20 @@ class DeleteMixin:
         threshold: float,
         deleted_ids: set[str],
         collector: dict | None = None,
+        held_pool: str | None = _NO_POOL_GUARD,
+        lock_guard=None,
     ) -> int:
         """Phase 2 for one memory: merge near-duplicates in its own partition.
+
+        ``held_pool`` is the dream pool whose lock the caller holds (None: a tier
+        the sweep never touches). A neighbour in another pool is left alone: the
+        lock covers one pool, and the sweep may be working on the other. The
+        dedup partition normally lies inside one pool; the two differ only for
+        rows whose ``owner_user_id`` is not their ``user_id``. Left at the
+        default no pool check is made (the sentinel is no longer used by ``dedup_memories``:
+        a page whose lock cannot be taken is skipped, never run unlocked).
+        ``lock_guard`` (called before every delete or tombstone) verifies the lock
+        is still this run's and raises ``_PoolLockLost`` when it is not.
 
         Searches with the row's STORED dense vector (the embedder is only
         called when the row has none) and restricts candidates to the same
@@ -1148,6 +1495,8 @@ class DeleteMixin:
 
             if hit_id == mid or hit_id in deleted_ids:
                 continue
+            if held_pool is not _NO_POOL_GUARD and _dream_pool_of(hit_payload) != held_pool:
+                continue
 
             # Merge the older one into the newer
             mem_created = mem["payload"].get("created_at", "")
@@ -1160,6 +1509,8 @@ class DeleteMixin:
 
             if older_id in deleted_ids:
                 continue
+            if lock_guard is not None:
+                lock_guard()  # raises _PoolLockLost: the lock is no longer ours, write nothing
             try:
                 if settings.dedup_semantic_tombstone_enabled:
                     self._tombstone_semantic_duplicate(older_id, newer_id, older_payload)

@@ -53,7 +53,8 @@ async def test_dedup_runs_for_every_user_whose_entries_were_compiled(writer):
     _log(writer, "2026-05-15", ("Use Qdrant", "alice"), ("Use Neo4j", "bob"), ("Use Redis", "alice"))
     service = MagicMock()
 
-    result = await _compile(writer, service, user_id="cron-user")
+    # the backlog / cron path (compile_all_pending) passes dedup_when_empty=False
+    result = await _compile(writer, service, user_id="cron-user", dedup_when_empty=False)
 
     called = sorted(c.args[0] for c in service.dedup_memories.call_args_list)
     assert called == ["alice", "bob"]  # not the cron's configured user
@@ -76,7 +77,7 @@ async def test_one_users_dedup_failure_does_not_stop_the_others(writer):
     service = MagicMock()
     service.dedup_memories.side_effect = [RuntimeError("boom"), {"ok": True}]
 
-    result = await _compile(writer, service, user_id="x")
+    result = await _compile(writer, service, user_id="x", dedup_when_empty=False)
 
     assert service.dedup_memories.call_count == 2
     assert result.dedup_triggered is False
