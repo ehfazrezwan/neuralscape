@@ -48,6 +48,7 @@ from index_format import index_row
 from ledger.port import IdempotencyConflict
 from schemas import (
     MEMORY_CATEGORIES,
+    graph_leg_signal,
     AskMemoryRequest,
     AskMemoryResponse,
     AssembleContextRequest,
@@ -557,7 +558,7 @@ async def search_memories(req: LegacySearchRequest, request: Request):
             user_id=user_id,
             limit=req.limit,
         )
-        return {"status": "ok", "results": result}
+        return {"status": "ok", "results": result, **graph_leg_signal(result)}
     except HTTPException:
         raise
     except Exception:
@@ -2211,12 +2212,13 @@ async def v1_search_memories(req: SearchMemoryRequest, request: Request):
         )
         if req.index_only:
             response = SearchIndexResponse(
-                results=[IndexRow(**index_row(r)) for r in results]
+                results=[IndexRow(**index_row(r)) for r in results],
+                **graph_leg_signal(results),
             )
             _meter_index_recall_bg("search_index", user_id, results, response)
             return response
         _meter_full_recall_bg("search", user_id, results)
-        return SearchMemoryResponse(results=results)
+        return SearchMemoryResponse(results=results, **graph_leg_signal(results))
     except HTTPException:
         raise
     except Exception as e:

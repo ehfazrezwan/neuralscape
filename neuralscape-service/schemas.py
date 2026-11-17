@@ -1347,10 +1347,53 @@ class StoreMemoryResponse(BaseModel):
     task_id: str | None = None
 
 
+class RecallResults(list):
+    """Hybrid recall rows (a plain ``list``) plus how the graph leg fared.
+
+    ``graph_leg`` is ``None`` when the leg contributed, was not configured, or
+    was not part of the call. Otherwise it says why the leg did not contribute:
+    ``"failed"`` (the graph search raised or reported an outage),
+    ``"timed_out"`` (it missed the join timeout or the leg budget) or
+    ``"skipped"`` (it could not be started). Every list consumer is unaffected.
+    """
+
+    graph_leg: str | None = None
+
+    def __init__(self, rows=(), graph_leg: str | None = None):
+        super().__init__(rows)
+        self.graph_leg = graph_leg
+
+
+def graph_leg_signal(results) -> dict:
+    """The additive response fields for a recall whose graph leg was lost.
+
+    Empty (the response is byte-identical to before) unless ``results`` carries
+    a ``graph_leg`` status. Shape: ``{"degraded": True, "graph_leg": <status>}``.
+    """
+    status = getattr(results, "graph_leg", None)
+    return {"degraded": True, "graph_leg": status} if status else {}
+
+
+def _omit_absent_graph_leg_signal(data):
+    if isinstance(data, dict):
+        for key in ("degraded", "graph_leg"):
+            if data.get(key) is None:
+                data.pop(key, None)
+    return data
+
+
 class SearchMemoryResponse(BaseModel):
     status: str = "ok"
     results: list[MemoryResponse] = Field(default_factory=list)
     graph_results: list[dict] | None = None
+    # Additive hybrid-recall signal: present only when the graph leg did not
+    # contribute (see RecallResults); the key is omitted otherwise.
+    degraded: bool | None = None
+    graph_leg: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_signal(self, handler):
+        return _omit_absent_graph_leg_signal(handler(self))
 
 
 class IndexRow(BaseModel):
@@ -1395,6 +1438,13 @@ class SearchIndexResponse(BaseModel):
     # overhead") + the measured numbers behind it. None when the meter is off.
     savings: str | None = None
     savings_detail: SavingsDetail | None = None
+    # Additive hybrid-recall signal, as on SearchMemoryResponse.
+    degraded: bool | None = None
+    graph_leg: str | None = None
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_signal(self, handler):
+        return _omit_absent_graph_leg_signal(handler(self))
 
 
 class GetMemoriesResponse(BaseModel):

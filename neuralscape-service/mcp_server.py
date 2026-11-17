@@ -33,7 +33,7 @@ from config import settings
 from memory.delete import MemoryListingFailed
 from memory.edit import RevisionConflict
 from memory_service import get_shared_service
-from schemas import CORE_MEMORY_CATEGORIES
+from schemas import CORE_MEMORY_CATEGORIES, graph_leg_signal
 from task_manager import TaskManager
 
 logger = logging.getLogger(__name__)
@@ -197,6 +197,7 @@ async def list_tools() -> list[Tool]:
                 "so when a title looks even plausibly relevant, fetch its full content rather than "
                 "ruling it out from the title alone — a full payload costs ~5-20x an index row, cheap "
                 "next to missing the memory you needed. "
+                "If the graph leg is lost, degraded/graph_leg is added (a second block, or object keys). "
                 "When project_id is provided, searches both global user memories and project-specific memories, "
                 "returning the most relevant results sorted by relevance score. "
                 "Full (non-index) results include a 'source' field: 'graph' results come from the knowledge "
@@ -1783,6 +1784,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                             ]
 
                         fused_output = {
+                            **graph_leg_signal(results),
                             "fused": True,
                             "sections": fused_sections,
                             "query": arguments["query"],
@@ -1818,6 +1820,7 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                 body = {
                     "index_only": True, "results": rows,
                     "hint": "Filter these rows, then call get_memories(ids=[...]) for full payloads.",
+                    **graph_leg_signal(results),
                 }
                 # E2: honest ledger entry for this recall — measured and
                 # recorded off the hot path (audit 27 #11).
@@ -1826,7 +1829,13 @@ async def call_tool(name: str, arguments: dict | None) -> list[TextContent]:
                     body, default=str, ensure_ascii=False))]
             _meter_mcp_full_bg("search", user_id, results)
             output = [r.model_dump(exclude_none=True) for r in results]
-            return [TextContent(type="text", text=json.dumps(output, default=str))]
+            blocks = [TextContent(type="text", text=json.dumps(output, default=str))]
+            signal = graph_leg_signal(results)
+            if signal:
+                # The result block keeps its array shape; the lost graph leg is
+                # reported in a second block, present only when it happened.
+                blocks.append(TextContent(type="text", text=json.dumps(signal)))
+            return blocks
 
         elif name == "get_memories":
             ids = arguments.get("ids")
