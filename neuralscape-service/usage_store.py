@@ -31,8 +31,12 @@ import threading
 import time
 from typing import Any, Callable, Iterator
 
+import structlog
+
 from contracts_usage import UsageEvent
 from contracts_usage_reconcile import UsageReconciliation, reconcile_usage_events
+
+logger = structlog.get_logger(__name__)
 
 _TABLES = """
 CREATE TABLE usage_events (
@@ -112,9 +116,35 @@ def _checksum(statements: list[str]) -> str:
 
 
 class _WriteDeadline:
-    """Set by the deadline timer of one write attempt when it fires."""
+    """State shared by one write attempt and its deadline timer.
 
-    fired = False
+    ``Timer.cancel`` cannot stop a callback that has already started, so a callback can run after its
+    attempt ended.  The attempt marks itself ``done`` under ``lock`` before it releases the connection;
+    a callback that gets the lock after that does nothing, and one that gets it first has ``fired`` set
+    before the attempt looks, so the attempt drops the connection it may be cancelling."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.done = False
+        self.fired = False
+
+    def fire(self) -> bool:
+        """Timer side: ``True`` when the attempt is still running (and is now marked fired)."""
+        with self.lock:
+            if self.done:
+                return False
+            self.fired = True
+            return True
+
+    def was_fired(self) -> bool:
+        with self.lock:
+            return self.fired
+
+    def finish(self) -> bool:
+        """Attempt side: mark the attempt over; ``True`` when the timer fired before that."""
+        with self.lock:
+            self.done = True
+            return self.fired
 
 
 class _SqlUsageStore:
@@ -425,7 +455,9 @@ class PostgresUsageStore(_SqlUsageStore):
     across an unbounded wait: a write (an append or a gap count) has a short budget (``append_budget_s``)
     covering the wait for the connection lock, the transaction's setup (``BEGIN``, the timeouts), the
     statement and one reconnect-and-retry (the insert is idempotent), so a slow or absent database costs
-    the provider-call thread at most that budget.
+    the provider-call thread at most that budget while the server can be reached.  When it cannot (the cancel
+    fails), the call ends at ``tcp_user_timeout`` (unacknowledged data) or, after the server acknowledged
+    the request, at the TCP keepalive detection time; both are a few seconds beyond the budget.
 
     The budget is enforced in three layers: the connection's *session* ``statement_timeout`` and
     ``lock_timeout`` are the append budget, so even ``BEGIN`` and the timeout statement are bounded by the
@@ -475,8 +507,16 @@ class PostgresUsageStore(_SqlUsageStore):
             autocommit=True,
             connect_timeout=connect_timeout,
             # Data sent and not acknowledged for this long fails the connection (a network stall the
-            # server's own timeouts cannot see); never shorter than the connect grace.
+            # server's own timeouts cannot see); never shorter than the connect grace.  libpq on some
+            # platforms ignores it.
             tcp_user_timeout=int(max(self._append_budget_s, 1.0) * 1000) + 1_000,
+            # A peer that vanishes AFTER the server acknowledged the request (the client is waiting for the
+            # reply) has no unacknowledged data, so ``tcp_user_timeout`` does not see it: keepalive probes
+            # end it, about ``idle + interval * count`` (3 s) after the peer stops answering.
+            keepalives=1,
+            keepalives_idle=1,
+            keepalives_interval=1,
+            keepalives_count=2,
         )
         # The session's timeouts are the WRITE budget: a stuck statement, ``BEGIN`` included, or a held
         # lock fails within it.  Reads, the rollup and migrations raise them for their own transaction
@@ -610,7 +650,11 @@ class PostgresUsageStore(_SqlUsageStore):
         (the driver's blocking call cannot be interrupted from here); the write's thread then sees the
         cancelled statement and raises :class:`UsageStoreError`."""
 
-        guard.fired = True
+        if not guard.fire():
+            return  # the attempt already ended: a late callback must not touch the next call's statement
+        # The attempt holds the connection lock until it has marked itself done, so a callback that got
+        # past ``fire`` sees this attempt's connection; it is dropped by the attempt (``fired``) and never
+        # reused, so this cancel cannot reach another call.
         conn = self._conn
         if conn is None:
             return
@@ -620,8 +664,12 @@ class PostgresUsageStore(_SqlUsageStore):
                 cancel(timeout=1.0)
             else:
                 conn.cancel()
-        except Exception:  # noqa: BLE001 - the connection is dropped by the write's thread either way
-            pass
+        except Exception as error:  # noqa: BLE001 - the connection is dropped by the write's thread either way
+            logger.warning(
+                "usage store: the deadline cancel could not be sent; the call is bounded only by the "
+                "connection's keepalives and tcp_user_timeout",
+                error=str(error),
+            )
 
     def _run_write(self, work: Callable[[Any], Any], budget_s: float | None = None) -> Any:
         """A write (an append, a gap count) within the append budget: the wait for the connection
@@ -631,7 +679,14 @@ class PostgresUsageStore(_SqlUsageStore):
 
         A timer armed for the whole attempt cancels the running statement at the deadline (see
         ``_deadline_cancel``) and the call raises :class:`UsageStoreError`, so a slow ``BEGIN``, a slow
-        timeout statement or a stalled network cannot stretch the call past its budget."""
+        timeout statement or a stalled statement cannot stretch the call past its budget.
+
+        What bounds the call when the network is the problem: if the cancel reaches the server the call
+        ends at the budget.  If the cancel cannot be sent (logged at WARNING), nothing interrupts the
+        blocked driver call: data the server has not acknowledged is bounded by ``tcp_user_timeout`` (budget
+        plus 1 s; ignored by libpq on some platforms), and a peer that vanished after acknowledging the
+        request by the connection's TCP keepalives (about 3 s of silence).  The budget is therefore a bound
+        only while the server is reachable, and the other bounds are a few seconds beyond it, not zero."""
 
         deadline = self._monotonic() + self._write_budget(budget_s)
         last: BaseException | None = None
@@ -649,10 +704,11 @@ class PostgresUsageStore(_SqlUsageStore):
                 try:
                     with self._txn(deadline, long_timeouts=False) as c:
                         # What is left after the (re)connect and ``BEGIN``, applied again to the statements.
-                        left = deadline - self._monotonic()
-                        if left <= 0:
+                        if deadline - self._monotonic() <= 0:
                             raise UsageStoreError("usage store append budget spent before the statement")
-                        budget_ms = max(1, int(left * 1000))
+                        # The value is computed as the statement is issued; the statement's own duration
+                        # is covered by the session timeouts and the deadline timer.
+                        budget_ms = max(1, int((deadline - self._monotonic()) * 1000))
                         c.execute(
                             "SELECT set_config('statement_timeout', %s, true),"
                             " set_config('lock_timeout', %s, true)",
@@ -662,7 +718,7 @@ class PostgresUsageStore(_SqlUsageStore):
                             raise UsageStoreError("usage store append budget spent in the transaction setup")
                         return work(c)
                 except Exception as error:
-                    if guard.fired:
+                    if guard.was_fired():
                         raise UsageStoreError("usage store write exceeded its deadline") from error
                     if attempt == 0 and self._connection_failure(error):
                         last = error
@@ -670,7 +726,7 @@ class PostgresUsageStore(_SqlUsageStore):
                     raise
             finally:
                 timer.cancel()
-                if guard.fired:
+                if guard.finish():
                     # A cancel was sent (or is in flight): never reuse the connection, so a late cancel
                     # cannot hit the next write's statement.
                     self._drop_connection()

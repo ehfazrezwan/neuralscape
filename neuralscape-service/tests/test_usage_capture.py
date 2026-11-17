@@ -477,39 +477,38 @@ def test_only_one_background_gap_flush_runs_at_a_time():
     assert len(set(entered)) == 1  # the second success did not start a second flusher
 
 
-def test_the_shutdown_flush_waits_for_a_running_cycle_and_persists_what_is_left(monkeypatch):
-    import threading
+def test_the_shutdown_flush_waits_for_a_running_cycle_and_persists_what_is_left(tmp_path):
+    """Real SQLite store: a background cycle holds a claimed gap when the service shuts down.  Without the
+    wait the store is closed under the cycle and the gap is lost (a store that kept accepting writes after
+    ``close()`` hid that)."""
+    import time
 
     import usage_capture
     import usage_store
     from usage_capture import DurableUsageRecorder
-    from tests.test_usage_store import event
+    from usage_store import SqliteUsageStore
+    from tests.test_usage_store import TENANT, event
 
-    gate = threading.Event()
-    gaps = {}
+    path = str(tmp_path / "usage.db")
+    store = SqliteUsageStore(path)
+    real_record_gap = store.record_gap
 
-    class Store:
-        def append(self, e, *, ledger_attempt=None):
-            return True
+    def slow_record_gap(*args, **kwargs):
+        time.sleep(0.3)  # a slow but in-budget gap write inside the background cycle
+        return real_record_gap(*args, **kwargs)
 
-        def record_gap(self, tenant_id, task_id, count, **kw):
-            gate.wait(5)
-            gaps[(tenant_id, task_id)] = gaps.get((tenant_id, task_id), 0) + count
-
-        def close(self):
-            pass
-
-    recorder = DurableUsageRecorder(Store())
+    store.record_gap = slow_record_gap
+    recorder = DurableUsageRecorder(store)
     usage_capture.set_usage_recorder(recorder)
     try:
-        recorder._unrecorded[("t", "a")] = 1
-        recorder.record(event("e1"))  # a cycle starts and waits on the gate
-        recorder._unrecorded[("t", "b")] = 2
-        threading.Timer(0.1, gate.set).start()
-        usage_store.uninstall_usage_capture(recorder._store)
+        recorder._unrecorded[(TENANT, "task-a")] = 1
+        recorder.record(event("e1", task="task-x"))  # a cycle starts and claims task-a
+        time.sleep(0.05)
+        usage_store.uninstall_usage_capture(store)  # waits for the cycle, then closes the store
     finally:
         usage_capture.set_usage_recorder(None)
-    assert gaps == {("t", "a"): 1, ("t", "b"): 2}
+    assert SqliteUsageStore(path).gaps(TENANT, "task-a") == 1
+    assert recorder.unrecorded == {}
 
 
 def test_one_deadline_bounds_every_retry_and_the_gap_flush_of_a_record_call():

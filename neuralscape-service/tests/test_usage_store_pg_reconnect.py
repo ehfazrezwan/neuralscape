@@ -13,6 +13,7 @@ import time
 import types
 
 import pytest
+import structlog.testing
 
 import usage_capture as uc
 import usage_store
@@ -40,9 +41,11 @@ class World:
         self.set_config_delay = 0.0  # seconds the per-transaction timeout statement takes
         self.block_inserts = False  # the next write statements run until cancelled
         self.cancels = 0
+        self.connect_kwargs: list[dict] = []
 
     def connect(self, dsn, **kwargs):
         self.connect_attempts += 1
+        self.connect_kwargs.append(kwargs)
         if not self.up:
             raise OperationalError("could not connect")
         self.opened += 1
@@ -432,3 +435,66 @@ def test_the_session_timeouts_are_the_write_budget_and_reads_raise_them_for_thei
     store.append(event("e1"))  # a write: only its own remaining-budget statement, never the long values
     (statement, lock), = world.set_configs
     assert int(statement.removesuffix("ms")) <= 1500 and statement == lock
+
+
+class _SilentTimer(threading.Timer):
+    """A deadline timer that never fires by itself: the test fires its callback by hand, late."""
+
+    made: list = []
+
+    def __init__(self, interval, function, args=None, kwargs=None):
+        super().__init__(interval, function, args, kwargs)
+        _SilentTimer.made.append(self)
+
+    def run(self):
+        return None
+
+
+@pytest.mark.parametrize("next_call", ["append", "read"])
+def test_a_deadline_timer_firing_after_its_attempt_ended_cancels_nothing(monkeypatch, next_call):
+    """``Timer.cancel`` cannot stop a callback that already started: it may run after its attempt
+    finished.  It must then do nothing, and the NEXT call on the same connection must be unaffected."""
+    _SilentTimer.made = []
+    monkeypatch.setattr(usage_store.threading, "Timer", _SilentTimer)
+    world = World()
+    store = make_store(world, monkeypatch, append_budget_s=1.0)
+    first_conn = store._conn
+    assert store.append(event("e1")) is True
+    late = _SilentTimer.made[-1]
+
+    late.function(*late.args)  # the stale callback runs now, after its write returned
+
+    assert world.cancels == 0 and not first_conn.cancelled.is_set()
+    assert store._conn is first_conn and world.opened == 1  # the connection was not dropped either
+    if next_call == "append":
+        assert store.append(event("e2")) is True
+    else:
+        assert store.schema_version() is not None
+    assert world.cancels == 0 and world.opened == 1 and world.stored[0] == "e1"
+
+
+def test_the_connection_sets_keepalives_that_bound_a_dead_peer(monkeypatch):
+    """With the cancel unable to reach the server, only the socket can end a blocked call after the
+    server acknowledged the request: keepalives must be on and a dead peer detected in a few seconds."""
+    world = World()
+    make_store(world, monkeypatch, append_budget_s=2.0)
+    kw = world.connect_kwargs[0]
+    assert kw["keepalives"] == 1
+    detect = kw["keepalives_idle"] + kw["keepalives_interval"] * kw["keepalives_count"]
+    assert 0 < detect <= 5
+    assert kw["tcp_user_timeout"] == 3_000  # unchanged: budget + 1 s grace
+
+
+def test_a_cancel_that_cannot_be_sent_is_logged_at_warning(monkeypatch):
+    world = World()
+    store = make_store(world, monkeypatch, append_budget_s=1.0)
+
+    def refused(timeout=30.0):
+        raise OperationalError("could not connect to the server to cancel")
+
+    store._conn.cancel_safe = refused
+    with structlog.testing.capture_logs() as logs:
+        store._deadline_cancel(usage_store._WriteDeadline())
+
+    warned = [r for r in logs if r["log_level"] == "warning"]
+    assert len(warned) == 1 and "cancel" in warned[0]["event"]
