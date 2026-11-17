@@ -3470,7 +3470,11 @@ async def v1_delete_episode(
     """Delete a single episodic node by UUID.
 
     Authorization: the episode must belong to one of the caller's readable
-    group_ids (private + shared + standard-when-enabled).
+    group_ids (private + shared + standard-when-enabled), and deleting it
+    requires the same permission as editing a memory in that group: a private
+    group is its owner's, a standard group is dictator-only, and a shared
+    group's episode needs a dictator or the owner of every memory that
+    references it (403 otherwise).
     """
     resolved_user_id = _resolve_user_id(request, user_id)
     try:
