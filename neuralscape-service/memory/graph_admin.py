@@ -328,9 +328,8 @@ class GraphAdminMixin:
         group_ids = _scoped_groups(_get_group_ids(user_id, project_id))
         try:
             # First verify the episode exists and is in an authorized group
-            async def _check_and_delete():
+            async def _check():
                 async with g.driver.session() as session:
-                    # Check episode exists and belongs to an authorized group
                     check = await session.run(
                         "MATCH (e:Episodic {uuid: $uuid}) RETURN e.group_id AS group_id",
                         uuid=episode_uuid,
@@ -344,14 +343,49 @@ class GraphAdminMixin:
                             f"Episode {episode_uuid} belongs to group {ep_group!r}, "
                             f"which is not in the caller's readable groups."
                         )
-                    # Authorized — delete it
-                    await session.run(
-                        "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
-                        uuid=episode_uuid,
-                    )
-                    return {"message": f"Episode {episode_uuid} deleted"}
+                    return {"group_id": ep_group}
 
-            return self._run_on_bridge(_check_and_delete())
+            checked = self._run_on_bridge(_check())
+            if "group_id" not in checked:
+                return checked
+            ep_group = checked["group_id"]
+
+            # Authorized: run the same cascade a memory delete runs (provenance.py) so the
+            # edges only this episode supports are removed (edges another episode still
+            # supports stay live), its entities are cleaned and the episode node is deleted.
+            cascade = self._cascade_expire_episode(ep_group, episode_uuid=episode_uuid, support_aware=True)
+            result: dict = {"message": f"Episode {episode_uuid} deleted"}
+            if cascade.get("resolved"):
+                result["graph_cascade"] = {
+                    k: cascade[k]
+                    for k in ("edges_expired", "edges_kept", "nodes_removed", "summaries_cleared")
+                    if k in cascade
+                }
+            else:
+                # Nothing resolved (or the cascade could not run): remove the node itself,
+                # as this endpoint always has.
+                async def _plain_delete():
+                    async with g.driver.session() as session:
+                        await session.run(
+                            "MATCH (e:Episodic {uuid: $uuid}) DETACH DELETE e",
+                            uuid=episode_uuid,
+                        )
+
+                self._run_on_bridge(_plain_delete())
+
+            # The memory rows that recorded this episode must not keep pointing at it.
+            # The repair also builds re-enrichment jobs for live siblings; they are dropped
+            # here: the operator removed this fact from the graph on purpose.
+            repair = self._repair_episode_siblings(
+                user_id, {episode_uuid}, set(), deleted_ids=set(), skip_job_ids=set()
+            )
+            if repair.get("unrepaired_ids") or repair.get("lookup_failed"):
+                result["episode_refs_unrepaired"] = list(repair.get("unrepaired_ids") or [])
+                logger.warning(
+                    "Episode %s deleted but memory row references not all cleared: %s",
+                    episode_uuid, repair,
+                )
+            return result
         except PermissionError:
             raise
         except Exception as e:

@@ -460,13 +460,14 @@ class TestDeleteEpisode:
         log = _driver_with(service, [{"group_id": "user--alice"}])
         _real_bridge(service)
         out = service.delete_episode("e1", user_id="alice")
-        assert out == {"message": "Episode e1 deleted"}
+        # The result may carry additive cascade/repair fields (this double has no row store).
+        assert out["message"] == "Episode e1 deleted"
         assert any("DETACH DELETE" in c for c, _ in log)
 
     def test_shared_group_is_authorised(self, service):
         _driver_with(service, [{"group_id": "shared"}])
         _real_bridge(service)
-        assert service.delete_episode("e1", user_id="alice") == {"message": "Episode e1 deleted"}
+        assert service.delete_episode("e1", user_id="alice")["message"] == "Episode e1 deleted"
 
     def test_project_group_requires_project_id(self, service):
         _driver_with(service, [{"group_id": "user--alice--project--p"}])
@@ -478,7 +479,7 @@ class TestDeleteEpisode:
         _driver_with(service, [{"group_id": "user--alice--project--p"}])
         _real_bridge(service)
         out = service.delete_episode("e1", user_id="alice", project_id="p")
-        assert out == {"message": "Episode e1 deleted"}
+        assert out["message"] == "Episode e1 deleted"
 
     def test_other_users_group_raises_and_does_not_delete(self, service):
         log = _driver_with(service, [{"group_id": "user--bob"}])

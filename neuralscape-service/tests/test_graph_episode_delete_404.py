@@ -86,4 +86,4 @@ def test_service_flags_an_unknown_episode_as_not_found():
 def test_service_deletes_a_known_episode():
     svc = _service_with_episodes([{"group_id": "user--alice"}])
     out = svc.delete_episode("e1", user_id="alice")
-    assert out == {"message": "Episode e1 deleted"}
+    assert out["message"] == "Episode e1 deleted"
