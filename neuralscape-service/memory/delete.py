@@ -253,7 +253,8 @@ def _is_tombstoned(payload: dict) -> bool:
 _DEDUP_TOP_K_STEPS = (10, 40, 160)
 
 # Reasons the semantic phase leaves a candidate or a neighbour alone without
-# merging it. Counted per run (the "dedup run" log line and the result's
+# merging it. Counters are per directed comparison, not per pair (a cross-partition
+# pair seen from both rows counts twice). Counted per run (the "dedup run" log line and the result's
 # ``semantic_declined``) so a pair that scores above the threshold but is not
 # merged is never silent. Pure observability: no decline changes behaviour.
 _DECLINE_REASONS = (
@@ -1556,6 +1557,7 @@ class DeleteMixin:
                 continue
             if lock_guard is not None:
                 lock_guard()  # raises _PoolLockLost: the lock is no longer ours, write nothing
+            merged_ok = False
             try:
                 if settings.dedup_semantic_tombstone_enabled:
                     self._tombstone_semantic_duplicate(older_id, newer_id, older_payload)
@@ -1565,20 +1567,22 @@ class DeleteMixin:
                     )
                 deleted_ids.add(older_id)
                 removed += 1
-                logger.info(
-                    "dedup semantic merge user=%s older=%s newer=%s score=%s mode=%s",
-                    user_id, older_id, newer_id, _hit_score(hit),
-                    "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete",
-                )
                 # Same reinforcement transfer as the exact phase: the
                 # near-duplicate we just merged away was a repeated
                 # observation — its counter moves to the survivor.
                 self._bump_times_derived(
                     newer_id, _times_derived_from_metadata(older_payload.get("metadata"))
                 )
+                merged_ok = True
             except Exception as e:
                 logger.warning(f"Failed to merge semantic dup {older_id}: {e}")
                 _decline(declines, "merge_failed")
+            if merged_ok:
+                logger.info(
+                    "dedup semantic merge user=%s older=%s newer=%s score=%s mode=%s",
+                    user_id, older_id, newer_id, _hit_score(hit),
+                    "tombstone" if settings.dedup_semantic_tombstone_enabled else "delete",
+                )
 
             # If we merged ourselves away, stop checking this memory
             if older_id == mid:

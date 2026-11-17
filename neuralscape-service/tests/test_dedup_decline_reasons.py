@@ -26,7 +26,9 @@ def test_merged_pair_is_named_in_an_info_line_and_the_summary_has_every_counter(
     assert not any(declined.values())
     text = caplog.text
     assert "dedup semantic merge user=u1 older=old newer=new score=" in text
-    assert "mode=delete" in text or "mode=tombstone" in text
+    from config import settings
+
+    assert f"mode={'tombstone' if settings.dedup_semantic_tombstone_enabled else 'delete'}" in text
     assert "declined_neighbour_other_partition=0" in text and "semantic_pairs_merged=1" in text
 
 
