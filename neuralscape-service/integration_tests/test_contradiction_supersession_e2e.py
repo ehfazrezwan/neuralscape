@@ -167,7 +167,10 @@ def test_compound_row_whose_job_edge_dies_is_not_superseded(svc):
 
     user = f"it-supersede-{uuid.uuid4().hex[:10]}"
     group = _build_group_id("private", user, None)
-    new_episode = "ep-synthetic-later-write"
+    # The probing "later write". The probe counts an invalidated edge only if its uuid
+    # is in the probing episode's own ``entity_edges``, so this episode must exist as an
+    # ``Episodic`` node listing the edge (seeded below, as Graphiti stores it).
+    new_episode = f"ep-later-write-{uuid.uuid4().hex[:10]}"
     try:
         row, _ = _write(svc, user, COMPOUND)
 
@@ -192,6 +195,14 @@ def test_compound_row_whose_job_edge_dies_is_not_superseded(svc):
             "MATCH ()-[r:RELATES_TO {uuid:$u}]->() "
             "SET r.invalid_at = datetime($now), r.expired_at = datetime($now)",
             u=job[0]["uuid"], now=now,
+        )
+        # A later write whose contradiction pass invalidated the job edge: Graphiti saves
+        # that episode with ``entity_edges = resolved + invalidated`` edge uuids. Same
+        # group, so the final group purge removes it.
+        _cypher(
+            svc,
+            "CREATE (:Episodic {uuid:$u, group_id:$g, entity_edges:$ee})",
+            u=new_episode, g=group, ee=[job[0]["uuid"]],
         )
 
         svc._maybe_supersede_contradicted(

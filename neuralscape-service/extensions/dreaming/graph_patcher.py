@@ -588,13 +588,19 @@ async def find_contradicted_edges(
     write_started_at: datetime,
     new_episode_uuid: str,
 ) -> list[dict]:
-    """RELATES_TO edges a graph write just invalidated (supersession probe).
+    """RELATES_TO edges THIS graph write just invalidated (supersession probe).
 
     Graphiti's ``add_episode`` contradiction pass sets BOTH ``invalid_at``
     (the new edge's ``valid_at``) and ``expired_at`` (now) on an older edge.
     Requiring ``invalid_at`` excludes the episode-delete cascade, which only
-    sets ``expired_at``. ``expired_at >= write_started_at`` bounds the probe
-    to this write's window. The edge must cite SOME episode other than the new
+    sets ``expired_at``. The edge must be listed in the probing episode's own
+    ``entity_edges`` (the edges Graphiti recorded that episode as resolving or
+    invalidating): that is the attribution, so an edge a CONCURRENT write in
+    the same group invalidated is never returned, whatever the timestamps.
+    No time comparison and no fallback: an episode with no such edge
+    supersedes nothing. ``expired_at >= write_started_at`` still bounds the
+    probe to this write's window (a dedup-resolved edge invalidated long ago
+    is in the list too). The edge must cite SOME episode other than the new
     one: an edge born expired by the new episode cites only it (drop), but when
     Graphiti resolves the new episode's extracted edge as a duplicate of an
     existing one it APPENDS the new episode to that edge's ``episodes`` and
@@ -607,9 +613,19 @@ async def find_contradicted_edges(
     """
     if not group_id or not new_episode_uuid:
         return []
+    # The time window alone also covers edges that a CONCURRENT write in the same
+    # group invalidated (several enrichment jobs of one user run at once), and no
+    # time comparison can tell the writes apart (they may share an ``occurred_at``).
+    # Graphiti stores the exact attribution on the episode node: ``entity_edges``
+    # lists the edges the episode resolved AND the edges it invalidated
+    # (``graphiti.py``: ``entity_edges = resolved_edges + invalidated_edges``, saved
+    # with the episode before ``add_episode`` returns). An episode that invalidated
+    # nothing has none of them in its list and so supersedes nothing.
     cypher = """
+    MATCH (new_ep:Episodic {uuid: $new_episode_uuid, group_id: $group_id})
     MATCH ()-[r:RELATES_TO]->()
     WHERE r.group_id = $group_id
+      AND r.uuid IN coalesce(new_ep.entity_edges, [])
       AND r.invalid_at IS NOT NULL
       AND r.expired_at >= datetime($since)
       AND any(ep IN coalesce(r.episodes, []) WHERE ep <> $new_episode_uuid)
