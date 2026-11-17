@@ -256,7 +256,16 @@ class LiveApi:
 
     url: str
     user_id: str
-    headers: dict = field(default_factory=dict, repr=False)
+    _static_headers: dict = field(default_factory=dict, repr=False)
+    identity: Any = field(default=None, repr=False)  # an ApiIdentity: bearer minted per access
+
+    @property
+    def headers(self) -> dict:
+        """Request headers; a minted bearer is created on each access (runs outlast a token)."""
+
+        if self.identity is not None and self.identity.token:
+            return self.identity.headers
+        return dict(self._static_headers)
 
     def __repr__(self) -> str:  # never show the token
         return f"LiveApi(url={redact(self.url)}, user_id={self.user_id!r})"
@@ -301,8 +310,7 @@ def live_api(api_user) -> LiveApi:
         error = f"{type(exc).__name__}: {exc}"
     if error:
         unavailable(f"the API at {url} is unreachable ({error})")
-    headers = api_user.headers if api_user.token else {}
-    return LiveApi(url=url, user_id=api_user.user_id, headers=headers)
+    return LiveApi(url=url, user_id=api_user.user_id, identity=api_user)
 
 
 # --------------------------------------------------------------------------
@@ -412,3 +420,89 @@ def unique_ns(request):
     if errors:
         # Leaked data would poison later runs: make the teardown an error.
         pytest.fail(redact(f"unique_ns cleanup failed: {errors}"), pytrace=False)
+
+
+# --------------------------------------------------------------------------
+# MemoryService teardown: close every service a test (or fixture) builds
+# --------------------------------------------------------------------------
+#
+# Each MemoryService that reaches its lazy init owns a Graphiti bridge (an
+# event-loop thread plus its selector and wake-up sockets), a Neo4j driver pool,
+# a Qdrant client and an embedder HTTP client. Most integration tests build one
+# and never close it, so a long run piles up file descriptors until the process
+# hits its NOFILE limit (the gate died with "Too many open files" while writing
+# the junit file). Tracking at construction needs no edit to the test files and
+# no product hook: one session-wide wrapper around the mixin ``__init__`` records
+# every instance, and autouse fixtures close what was created in their scope.
+# ``MemoryService.close()`` is idempotent, so tests that close their own are safe.
+
+_TRACKED_SERVICES: list = []
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _track_memory_services():
+    try:
+        import third_party_telemetry  # noqa: F401  (guard must precede service imports)
+        from memory import core as _core
+    except Exception:  # noqa: BLE001 - tests that never touch the service still run
+        yield
+        return
+    original = _core.CoreMixin.__init__
+
+    def tracking_init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _TRACKED_SERVICES.append(self)
+
+    _core.CoreMixin.__init__ = tracking_init
+    try:
+        yield
+    finally:
+        _core.CoreMixin.__init__ = original
+        _close_tracked_services(0)
+
+
+def _close_tracked_services(start: int) -> None:
+    """Close (and forget) every service tracked since index ``start``, newest first."""
+    services = _TRACKED_SERVICES[start:]
+    del _TRACKED_SERVICES[start:]
+    shared = sys.modules.get("memory_service")
+    for svc in reversed(services):
+        try:
+            svc.close()
+        except Exception:  # noqa: BLE001 - teardown is best effort
+            pass
+        if shared is not None and getattr(shared, "_shared_service", None) is svc:
+            shared._shared_service = None  # the next get_shared_service() builds a fresh one
+        _drop_copies_of(svc)
+
+
+def _drop_copies_of(svc) -> None:
+    """Point every module-level or wrapper copy of a closed service at a fresh one.
+
+    ``main`` and ``mcp_server`` bind ``_service = get_shared_service()`` at import;
+    ``NSMemorySystem`` caches it lazily. Without this they would keep a closed service.
+    """
+    import gc
+
+    shared = sys.modules.get("memory_service")
+    for name in ("main", "mcp_server"):
+        mod = sys.modules.get(name)
+        if mod is not None and getattr(mod, "_service", None) is svc and shared is not None:
+            mod._service = shared.get_shared_service()
+    for obj in gc.get_objects():
+        if type(obj).__name__ == "NSMemorySystem" and getattr(obj, "_service", None) is svc:
+            obj._service = None  # lazy-loads the new shared service on next use
+
+
+@pytest.fixture(autouse=True)
+def _close_services_built_by_the_test(_track_memory_services):
+    mark = len(_TRACKED_SERVICES)
+    yield
+    _close_tracked_services(mark)
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _close_services_built_by_module_fixtures(_track_memory_services):
+    mark = len(_TRACKED_SERVICES)
+    yield
+    _close_tracked_services(mark)

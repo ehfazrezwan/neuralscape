@@ -1,5 +1,6 @@
 """Schemas for neuralscape-service: enums, category taxonomy, request/response models."""
 
+import re
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
@@ -351,6 +352,22 @@ def validate_adapter_name(v: str) -> str:
 MAX_RECALL_WORKSPACES = 10
 
 
+WORKSPACE_PATTERN = r"^[a-zA-Z0-9_.\-]+$"
+WORKSPACE_MAX_LENGTH = 100
+_WORKSPACE_RE = re.compile(WORKSPACE_PATTERN)
+
+
+def normalize_workspace(value: str | None) -> str | None:
+    """The workspace a write is stored under: absent, ``""`` and ``"memory"`` all mean the
+    memory workspace and normalise to None (the untagged rows' value), so store_raw's
+    dedup key matches rows written without a workspace. Raises ValueError when malformed."""
+    if value is None or value in ("", "memory"):
+        return None
+    if len(value) > WORKSPACE_MAX_LENGTH or not _WORKSPACE_RE.fullmatch(value):
+        raise ValueError("workspace may only contain letters, digits, '_', '.', '-' (max 100)")
+    return value
+
+
 def validate_workspace_names(v: list[str] | None) -> list[str] | None:
     """Validate a recall ``workspaces`` list: names match the write-side
     ``workspace`` pattern, at most MAX_RECALL_WORKSPACES entries, duplicates
@@ -582,8 +599,8 @@ class RawMemoryRequest(BaseModel):
     # Workspace partition (WT6, optional)
     workspace: str | None = Field(
         default=None,
-        max_length=100,
-        pattern=r"^[a-zA-Z0-9_.\-]+$",
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
         description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
     )
 
@@ -687,8 +704,8 @@ class IngestDocumentRequest(BaseModel):
     )
     workspace: str | None = Field(
         default=None,
-        max_length=100,
-        pattern=r"^[a-zA-Z0-9_.\-]+$",
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
         description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
     )
 
@@ -745,6 +762,12 @@ class IngestTextRequest(BaseModel):
         max_length=100,
         description="Knowledge adapter selecting taxonomy/chunker/extractor/graph-ontology (e.g. 'default', 'trading_strategy').",
     )
+    workspace: str | None = Field(
+        default=None,
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
+        description="Workspace partition: absent or 'memory' = memory type; any other value = reference workspace",
+    )
     occurred_at: str | None = Field(
         default=None,
         description=(
@@ -799,6 +822,12 @@ class ConnectorConfigRequest(BaseModel):
     default_scope: str = Field(default="global")
     default_project_id: str | None = Field(default=None, max_length=100, pattern=_ID_PATTERN)
     default_visibility: MemoryVisibility | None = Field(default=None)
+    default_workspace: str | None = Field(
+        default=None,
+        max_length=WORKSPACE_MAX_LENGTH,
+        pattern=WORKSPACE_PATTERN,
+        description="Workspace for memories produced by this connector's syncs (absent = memory workspace, or the adapter's reference workspace)",
+    )
 
     @field_validator("connector_type")
     @classmethod

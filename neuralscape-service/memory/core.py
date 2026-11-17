@@ -24,6 +24,11 @@ logger = logging.getLogger(__name__)
 # that persists still fails start-up after the last attempt.
 _COLD_START_ATTEMPTS = 8
 
+# How long close() waits for the Graphiti driver to close on the bridge loop.
+# Shutdown must never park for the bridge's general call limit (minutes): a
+# loop that was stopped or is wedged would block it for the whole limit.
+_CLOSE_DRIVER_TIMEOUT_S = 5.0
+
 
 def _is_collection_exists_conflict(exc: BaseException) -> bool:
     """Qdrant's 409 ``Collection `x` already exists!``: another process created it first.
@@ -62,6 +67,57 @@ def _is_concurrent_creation(exc: BaseException) -> bool:
     return _is_collection_exists_conflict(exc) or _is_collection_not_yet_readable(exc)
 
 
+# ``Settings.get_mem0_config`` sets this ``history_db_path`` when ``MEM0_HISTORY_ENABLED``
+# is off. mem0 then opens a throwaway in-memory SQLite instead of ``~/.mem0/history.db``,
+# and ``_memory_from_config`` swaps that for ``_NoHistory`` so no row is ever kept.
+_NO_HISTORY_DB_PATH = ":memory:"
+
+
+class _NoHistory:
+    """Drop-in for mem0's ``SQLiteManager`` that records nothing.
+
+    The service writes mem0's history on every memory (``m.db.add_history`` in the
+    write path, plus mem0's own ``_update_memory`` / ``_delete_memory``) but never reads
+    it, so each row was a pointless synchronous disk write. Every method of the real
+    manager the ``Memory`` / ``AsyncMemory`` code calls is here and does nothing.
+    """
+
+    connection = None
+
+    def add_history(self, *args, **kwargs) -> None:
+        return None
+
+    def batch_add_history(self, records) -> None:
+        return None
+
+    def get_history(self, memory_id):
+        return []
+
+    def save_messages(self, messages, session_scope) -> None:
+        return None
+
+    def get_last_messages(self, session_scope, limit=10):
+        return []
+
+    def reset(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
+def _drop_history(memory) -> None:
+    """Replace ``memory.db`` (an in-memory SQLiteManager) with ``_NoHistory``."""
+    old = getattr(memory, "db", None)
+    memory.db = _NoHistory()
+    close = getattr(old, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001 - a throwaway in-memory database
+            logger.debug("closing the throwaway mem0 history db failed", exc_info=True)
+
+
 def _memory_from_config(memory_cls, config):
     """``Memory.from_config``, tolerating a concurrent first start.
 
@@ -76,7 +132,10 @@ def _memory_from_config(memory_cls, config):
     """
     for attempt in range(1, _COLD_START_ATTEMPTS + 1):
         try:
-            return memory_cls.from_config(config)
+            memory = memory_cls.from_config(config)
+            if isinstance(config, dict) and config.get("history_db_path") == _NO_HISTORY_DB_PATH:
+                _drop_history(memory)
+            return memory
         except Exception as exc:
             if attempt == _COLD_START_ATTEMPTS or not _is_concurrent_creation(exc):
                 raise
@@ -109,6 +168,8 @@ class CoreMixin:
         self._graph_init_error: str | None = None
         self._genai_model = None
         self._init_lock = threading.Lock()
+        # True from a close() that released something until the next rebuild.
+        self._closed = False
 
     def _get_memory(self):
         """Lazy-initialize mem0 Memory with Graphiti backend.
@@ -127,9 +188,21 @@ class CoreMixin:
         Without this re-attach every graph write is a silent no-op and
         the health check reports ``graph_store: not_initialized``.
         """
+        if self._memory is not None and getattr(self, "_closed", False):
+            # close() released this service's clients, bridge and driver (it is the only
+            # place that sets _closed, and only when it had something to release, so
+            # everything dropped here was closed already). Never hand those closed
+            # objects to a later caller: drop them so the build below makes fresh ones.
+            with self._init_lock:
+                if self._memory is not None and getattr(self, "_closed", False):
+                    self._memory = None
+                    self._graphiti = None
+                    self._bridge = None
         if self._memory is None:
             with self._init_lock:
                 if self._memory is None:
+                    # The one place `_closed` is cleared, exactly once per rebuild.
+                    self._note_reopen_if_closed(clear=True)
                     from mem0 import Memory
 
                     config = settings.get_mem0_config()
@@ -256,20 +329,105 @@ class CoreMixin:
         if self._genai_model is None:
             with self._init_lock:
                 if self._genai_model is None:
-                    self._genai_model = genai.Client(api_key=settings.google_api_key)
+                    # close() dropped the old client; a rebuild after it is visible
+                    # in the log. `_closed` stays set: only the memory rebuild clears it.
+                    self._note_reopen_if_closed(clear=False)
+                    self._genai_model = genai.Client(
+                        api_key=settings.google_api_key,
+                        http_options=settings.gemini_http_options(),
+                    )
         return self._genai_model
 
+    def _note_reopen_if_closed(self, *, clear: bool) -> None:
+        """Log ONE warning when a service that close() released builds clients again.
+
+        Caller holds ``_init_lock``. A late request, or a shutdown thread that was
+        abandoned by its timeout, reopening clients after shutdown must leave a trace.
+        """
+        if getattr(self, "_closed", False):
+            logger.warning(
+                "MemoryService %s was closed and is being reopened: building new clients "
+                "(a request or task ran after shutdown)",
+                id(self),
+            )
+            if clear:
+                self._closed = False
+
     def close(self):
-        """Clean up resources."""
+        """Clean up resources: Graphiti driver, bridge loop, Qdrant and embedder clients.
+
+        Idempotent (a second call is a no-op). A later use of the service rebuilds its
+        clients (and logs a warning); the flag and the snapshot are taken under the init lock.
+        On a stopped bridge loop the driver's sockets cannot be closed: they are
+        abandoned to the OS (bounded by the process lifetime). The Qdrant and embedder client
+        closes never raise; a failure closing the Graphiti driver still
+        propagates, after everything else has been released.
+
+        Worst-case duration (a wedged bridge loop that never answers): the driver
+        close waits 5 s, then ``_AsyncBridge.shutdown`` waits up to 10 s for its
+        tasks to cancel and up to 10 s for the loop thread to stop, so about 25 s;
+        callers still blocked in the bridge are released when it returns.
+        """
+        # Flip the flag and take the clients under the same lock the lazy build uses,
+        # so a concurrent rebuild either finishes first (and its clients are the ones
+        # closed here) or starts afterwards (and builds fresh ones): none is orphaned.
+        # Nothing to release (never initialised, or already closed) leaves the flag
+        # alone, so the first real use after that is an ordinary build, not a "reopen".
+        with self._init_lock:
+            if getattr(self, "_closed", False):
+                return
+            graphiti, bridge, memory = self._graphiti, self._bridge, self._memory
+            genai_client = self._genai_model
+            if all(x is None for x in (graphiti, bridge, memory, genai_client)):
+                return
+            # The Gemini client holds nothing to release: drop it so a later use builds
+            # a new one (and logs it) like the other clients. The rest stays in place,
+            # closed, until the next _get_memory() replaces it.
+            self._genai_model = None
+            self._closed = True
         try:
-            if self._graphiti and self._bridge:
-                self._bridge.run(self._graphiti.close())
+            if graphiti and bridge:
+                try:
+                    # The bridge closes the coroutine itself when it cannot run it
+                    # (shut-down bridge) and cancels it when its loop is stopped.
+                    bridge.run(graphiti.close(), timeout=_CLOSE_DRIVER_TIMEOUT_S)
+                except TimeoutError:
+                    # A stopped or wedged bridge loop never answers; do not
+                    # wait out the general bridge limit. The loop is torn down
+                    # right below; the driver's sockets are abandoned to the OS.
+                    logger.warning(
+                        "Graphiti driver did not close within %.0fs; abandoning it",
+                        _CLOSE_DRIVER_TIMEOUT_S,
+                    )
         finally:
             # Stop the bridge loop AFTER the driver closed on it (even when that
             # close raised), so no task or driver outlives its loop.
-            shutdown = getattr(self._bridge, "shutdown", None)
-            if callable(shutdown):
-                shutdown()
+            try:
+                shutdown = getattr(bridge, "shutdown", None)
+                if callable(shutdown):
+                    shutdown()
+            finally:
+                if memory is not None:  # never fall back to self._memory: it may be a rebuild
+                    self._close_http_clients(memory)
+
+    def _close_http_clients(self, memory=None) -> None:
+        """Best-effort close of the Qdrant client, the embedder's HTTP client and mem0's
+        own resources (the SQLite history connection)."""
+        if memory is None:
+            memory = self._memory
+        if memory is None:
+            return
+        closers = [
+            getattr(getattr(getattr(memory, "vector_store", None), "client", None), "close", None),
+            getattr(getattr(getattr(memory, "embedding_model", None), "client", None), "close", None),
+            getattr(memory, "close", None),  # mem0 Memory.close(): history SQLite connection
+        ]
+        for closer in closers:
+            if callable(closer):
+                try:
+                    closer()
+                except Exception as e:  # noqa: BLE001 - shutdown must not raise from here
+                    logger.debug("client close failed (ignored): %s", e)
 
     def _ensure_created_at_index(self) -> None:
         """Best-effort: ensure a DATETIME payload index on ``created_at``.

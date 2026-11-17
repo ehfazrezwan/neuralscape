@@ -452,7 +452,7 @@ class EditMixin:
 
     @staticmethod
     def _record_edit_history(m, memory_id: str, old_payload: dict, text: str, now_iso: str) -> None:
-        """The history row and entity-store upkeep mem0's own update does, after the text CAS applied."""
+        """The history row mem0's own update writes, after the text CAS applied (best effort)."""
         try:
             m.db.add_history(
                 memory_id,
@@ -464,11 +464,8 @@ class EditMixin:
                 actor_id=old_payload.get("actor_id"),
                 role=old_payload.get("role"),
             )
-            session_filters = {k: old_payload[k] for k in ("user_id", "agent_id", "run_id") if old_payload.get(k)}
-            m._remove_memory_from_entity_store(memory_id, session_filters)
-            m._link_entities_for_memory(memory_id, text, session_filters)
-        except Exception as e:  # noqa: BLE001 - history/entity upkeep is best effort, as in mem0
-            logger.warning("History/entity upkeep failed for %s: %s", memory_id, e)
+        except Exception as e:  # noqa: BLE001 - history upkeep is best effort, as in mem0
+            logger.warning("History upkeep failed for %s: %s", memory_id, e)
 
     @staticmethod
     def _bm25_sparse(m, text: str):
