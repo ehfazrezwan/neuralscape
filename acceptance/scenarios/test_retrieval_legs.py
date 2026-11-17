@@ -14,7 +14,11 @@ away when that leg is broken:
 - the ask path's verbatim-episode evidence pass (one LLM call, asserted on the
   response's ``searches`` list, never on wording).
 
-Writes are LLM-free (``/v1/memories/raw``); only the ask test calls the LLM.
+Writes are LLM-free (``/v1/memories/raw``); only the ask test and the one conversation write behind the
+episode scenarios call the LLM. Why a conversation write: for a RAW write the episode text equals the memory
+text, so recall's twin-drop (a row whose text is contained in another's is dropped) rightly returns that text
+once, and no second, identical episode row exists to look for. A conversation's episode is the transcript while
+its memories are distilled paraphrases, so the episode row is not a twin of any memory row and must surface.
 Graph enrichment of every write is queued on the graph worker as usual, so the
 module keeps its own writes small.
 """
@@ -26,7 +30,7 @@ import pytest
 from conftest import GraphSeed
 from nsaccept import eventually, expect_check_fails, negative_control, proves
 from nsaccept.client import NSClient
-from nsaccept.helpers import graph_listing, write_raw
+from nsaccept.helpers import graph_listing, list_rows, write_raw
 
 GRAPH_WAIT = 240
 EPISODE_ROW_PREFIX = "[verbatim session excerpt]"
@@ -108,15 +112,30 @@ def check_episode_row(client: NSClient, query: str, project: str, marker: str) -
     return results
 
 
+def check_text_returned_once(client: NSClient, text: str, project: str) -> list[dict]:
+    """Recall for ``text`` returns that exact text in exactly one row, and that row is the memory (not an episode)."""
+    results = client.search(text, project_id=project, limit=30)
+    return check_exactly_one_row_with(results, text)
+
+
+def check_exactly_one_row_with(results: list[dict], text: str) -> list[dict]:
+    rows = [r for r in results if text in (r.get("memory") or "")]
+    assert len(rows) == 1, f"{len(rows)} rows carry the text, want exactly one: {[(r.get('source'), r.get('id')) for r in rows]}"
+    assert rows[0].get("source") != "episode", f"the single row is the episode, not the memory: {rows[0].get('id')}"
+    return results
+
+
 def check_episode_written(client: NSClient, project: str, marker: str) -> None:
     episodes = graph_listing(client, "episodes", project)
     assert any(marker in (e.get("content") or "") for e in episodes), f"no episode carries {marker} among {len(episodes)}"
 
 
-def check_unscored_rows_rank_last(results: list[dict], memory_id: str) -> None:
-    """The memory itself leads; every row without a score comes after every scored row."""
+def check_unscored_rows_rank_last(results: list[dict], memory_id: "str | set[str]") -> None:
+    """The memory itself leads (``memory_id`` may be a set: the conversation's memories that carry the marker);
+    every row without a score comes after every scored row."""
     assert results, "no results"
-    assert results[0].get("id") == memory_id, f"top hit is {results[0].get('id')!r} ({results[0].get('source')}), not the memory"
+    leaders = {memory_id} if isinstance(memory_id, str) else set(memory_id)
+    assert results[0].get("id") in leaders, f"top hit is {results[0].get('id')!r} ({results[0].get('source')}), not the memory {sorted(leaders)}"
     scores = [r.get("score") for r in results]
     unscored = [i for i, s in enumerate(scores) if s is None]
     scored = [i for i, s in enumerate(scores) if isinstance(s, (int, float))]
@@ -145,6 +164,52 @@ def check_ask_used_episodes(body: dict) -> None:
 
 
 # ── fixtures ─────────────────────────────────────────────────────
+
+
+@pytest.fixture(scope="module")
+def episode_conv(ctx, a, graph_seed) -> dict:
+    """One conversation written through ``POST /v1/memories`` (LLM extraction): its episode is the transcript,
+    its memories are distilled facts. The transcript line is chatty on purpose, so no extracted fact is a
+    substring of it (``twin`` lists any that is: a precondition the scenarios assert). The marker is the NAME of
+    something the speaker decided, because the extractor keeps decided names verbatim but paraphrases away a
+    nickname or an aside (the previous wording, a cat that "answers to" the marker, produced one fact without it)."""
+    project = f"{ctx.project_id}-epconv"
+    marker = f"zq-{ctx.run_id}-epc"
+    line = f"Funny story: after weeks of arguing we decided the new ferry timetable app will be called {marker}, although honestly nobody likes the name."
+    out: dict = {"project": project, "marker": marker, "line": line, "ids": [], "facts": [], "twin": [], "error": ""}
+    try:
+        resp = a.post(
+            "/v1/memories",
+            json={
+                "messages": [{"role": "user", "content": line}, {"role": "assistant", "content": "Lovely, I will remember that."}],
+                "project_id": project,
+                "run_id": f"acc-{ctx.run_id}-epc",
+            },
+        )
+        assert resp.status_code == 202, f"POST /v1/memories -> {resp.status_code}: {resp.text[:200]}"
+        status = a.poll_task(resp.json()["task_id"], timeout=240)
+        assert status.get("status") == "completed", f"conversation write ended as {status}"
+        produced = len(((status.get("result") or {}).get("memories")) or [])
+
+        def extracted():
+            rows = [r for r in list_rows(a, project_id=project) if marker in (r.get("memory") or "")]
+            assert rows, f"no extracted memory carries the marker yet (the write reported {produced} stored fact(s))"
+            return rows
+
+        carrying = eventually(extracted, timeout=90, what="extracted memory carrying the marker")
+        out["ids"] = [r["id"] for r in carrying]
+        out["facts"] = [r["memory"] for r in carrying]
+        out["twin"] = [f for f in out["facts"] if f in line or line in f]
+    except AssertionError as exc:
+        out["error"] = str(exc)
+    return out
+
+
+def require_conv(conv: dict) -> dict:
+    assert not conv["error"], conv["error"]
+    assert conv["ids"], "the conversation produced no memory carrying the marker"
+    assert not conv["twin"], f"precondition: extracted fact(s) are verbatim in the transcript line, so recall would twin-drop the episode row: {conv['twin']}"
+    return conv
 
 
 @pytest.fixture(scope="module")
@@ -260,42 +325,43 @@ def test_bm25_health_check_fails_for_a_predating_collection(anon):
 
 
 @proves("read.episode-bm25-leg")
-def test_recall_returns_the_verbatim_episode_row_of_a_write(ctx, a, graph_seed: GraphSeed):
-    """Once the graph worker has written the episode, recall carries it as a ``source: episode`` row
-    with the verbatim-excerpt prefix and no score (GRAPH_EPISODE_RECALL_ENABLED is on by default)."""
-    graph_seed.first.require()
+def test_recall_returns_the_verbatim_episode_row_of_a_write(ctx, a, episode_conv):
+    """Once the graph worker has written the conversation's episode, recall carries it as a ``source: episode``
+    row with the verbatim-excerpt prefix and no score (GRAPH_EPISODE_RECALL_ENABLED is on by default). The
+    episode is the transcript and the memories are paraphrases, so it is not a twin of any memory row."""
+    conv = require_conv(episode_conv)
     eventually(
-        lambda: check_episode_row(a, graph_seed.first.content, ctx.project_id, graph_seed.first.marker),
+        lambda: check_episode_row(a, conv["line"], conv["project"], conv["marker"]),
         timeout=GRAPH_WAIT, interval=10, what="episode row in recall",
     )
 
 
 @proves("read.episode-bm25-leg")
 @negative_control
-def test_episode_row_check_fails_for_user_b_and_an_unwritten_marker(ctx, b, a, graph_seed: GraphSeed):
-    graph_seed.first.require()
-    expect_check_fails(check_episode_row, b, graph_seed.first.content, ctx.project_id, graph_seed.first.marker)
-    expect_check_fails(check_episode_row, a, graph_seed.first.content, ctx.project_id, f"zq-{ctx.run_id}-never")
+def test_episode_row_check_fails_for_user_b_and_an_unwritten_marker(ctx, b, a, episode_conv):
+    conv = require_conv(episode_conv)
+    expect_check_fails(check_episode_row, b, conv["line"], conv["project"], conv["marker"])
+    expect_check_fails(check_episode_row, a, conv["line"], conv["project"], f"zq-{ctx.run_id}-never")
 
 
 @proves("read.episode-bm25-leg")
-def test_unscored_rows_never_outrank_scored_ones_and_the_memory_itself_leads(ctx, a, graph_seed: GraphSeed):
-    """Query with a stored fact's own text: the memory is the top hit, its graph edges are scored rows,
+def test_unscored_rows_never_outrank_scored_ones_and_the_memory_itself_leads(ctx, a, episode_conv):
+    """Query with an extracted fact's own text: the memory is the top hit, its graph edges are scored rows,
     its episode row has no score, and no unscored row sits above a scored one (a positional
     interleave of the legs would put them there)."""
-    first = graph_seed.first.require()
+    conv = require_conv(episode_conv)
 
     def check():
-        results = check_episode_row(a, first.content, ctx.project_id, first.marker)
-        check_unscored_rows_rank_last(results, first.memory_id)
+        results = check_episode_row(a, conv["facts"][0], conv["project"], conv["marker"])
+        check_unscored_rows_rank_last(results, set(conv["ids"]))
 
     eventually(check, timeout=GRAPH_WAIT, interval=10, what="merit-ordered recall with an episode row")
 
 
 @proves("read.episode-bm25-leg")
 @negative_control
-def test_merge_check_fails_for_an_interleaved_list(graph_seed: GraphSeed):
-    mid = graph_seed.first.memory_id or "m"
+def test_merge_check_fails_for_an_interleaved_list(episode_conv):
+    mid = (episode_conv["ids"] or ["m"])[0]
     interleaved = [
         {"id": mid, "score": 0.99, "source": "vector"},
         {"id": "ep-1", "score": None, "source": "episode"},
@@ -303,6 +369,29 @@ def test_merge_check_fails_for_an_interleaved_list(graph_seed: GraphSeed):
     ]
     expect_check_fails(check_unscored_rows_rank_last, interleaved, mid)
     expect_check_fails(check_unscored_rows_rank_last, [{"id": "other", "score": 0.9}, {"id": mid, "score": 0.5}], mid)
+
+
+@proves("read.episode-bm25-leg")
+def test_a_raw_write_is_recalled_exactly_once_not_again_as_its_own_episode(ctx, a, graph_seed: GraphSeed):
+    """For a raw write the episode text equals the memory text. Recall's twin-drop returns that text once:
+    the product behaviour, not a lost row. Awaited through the graph listing first, so a pass cannot mean
+    the episode was simply not written yet."""
+    first = graph_seed.first.require()
+    eventually(
+        lambda: check_episode_written(a, ctx.project_id, first.marker),
+        timeout=GRAPH_WAIT, interval=10, what="graph episode of the raw seed write",
+    )
+    check_text_returned_once(a, first.content, ctx.project_id)
+
+
+@proves("read.episode-bm25-leg")
+@negative_control
+def test_once_check_fails_for_a_repeated_text_and_for_an_episode_only_row(graph_seed: GraphSeed):
+    text = graph_seed.first.content or "the seeded text"
+    twice = [{"id": "m1", "source": "vector", "memory": text}, {"id": "ep-1", "source": "episode", "memory": f"{EPISODE_ROW_PREFIX} {text}"}]
+    expect_check_fails(check_exactly_one_row_with, twice, text)
+    expect_check_fails(check_exactly_one_row_with, [{"id": "ep-1", "source": "episode", "memory": f"{EPISODE_ROW_PREFIX} {text}"}], text)
+    expect_check_fails(check_exactly_one_row_with, [], text)
 
 
 # ── reinforcement boost ──────────────────────────────────────────
