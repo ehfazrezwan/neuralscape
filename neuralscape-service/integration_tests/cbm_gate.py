@@ -61,6 +61,11 @@ def cbm_decision(probe: Callable[[str | None], bool] = probe_bridge) -> tuple[st
         if integration_required():
             return FAIL, f"CBM_BRIDGE_URL is set but the bridge is unreachable (waiver does not apply): {reason}"
         return SKIP, reason
+    if integration_required() and waived("cbm"):
+        from integration_tests.conftest import waiver_tag
+
+        # The tag is what lets the conftest skip rule allow exactly this skip on the gate.
+        return SKIP, f"{waiver_tag('cbm')} {reason}"
     if integration_required() and not waived("cbm"):
         return FAIL, (
             f"NS_INTEGRATION_REQUIRED is set but {reason}; start the cbm-bridge profile or, "

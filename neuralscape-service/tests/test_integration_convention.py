@@ -17,6 +17,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 SERVICE_ROOT = Path(__file__).resolve().parent.parent
 TESTS_DIR = SERVICE_ROOT / "tests"
 INTEGRATION_DIR = SERVICE_ROOT / "integration_tests"
@@ -170,6 +172,72 @@ def test_a_failing_cleanup_fails_the_teardown(tmp_path):
     out = _pytest([str(area)], tmp_path)
     assert out.returncode == 1 and "1 passed, 1 error" in out.stdout, out.stdout + out.stderr
     assert "unique_ns cleanup failed" in out.stdout and "could not drop" in out.stdout
+
+
+def _area_with(tmp_path, files, *, copy_cbm_gate=False):
+    area = tmp_path / "integration_tests"
+    area.mkdir()
+    shutil.copy(INTEGRATION_DIR / "conftest.py", area / "conftest.py")
+    if copy_cbm_gate:
+        shutil.copy(INTEGRATION_DIR / "cbm_gate.py", area / "cbm_gate.py")
+    for name, text in files.items():
+        (area / name).write_text(text, encoding="utf-8")
+    return area
+
+
+_DIRECT_SKIP = "import pytest\n\ndef test_proof():\n    pytest.skip('flag-on proof not run')\n"
+_IMPORTORSKIP = "import pytest\n\nmissing = pytest.importorskip('no_such_driver_nsit')\n\ndef test_proof():\n    pass\n"
+_SKIPIF = "import pytest\n\n@pytest.mark.skipif(True, reason='never runs')\ndef test_proof():\n    pass\n"
+_SKIP_IN_FIXTURE = (
+    "import pytest\n\n@pytest.fixture\ndef dep():\n    pytest.skip('dep missing')\n\n"
+    "def test_proof(dep):\n    pass\n"
+)
+
+
+@pytest.mark.parametrize("source", [_DIRECT_SKIP, _IMPORTORSKIP, _SKIPIF, _SKIP_IN_FIXTURE], ids=["direct", "importorskip", "skipif", "fixture"])
+def test_a_skip_fails_when_integration_is_required_and_still_skips_elsewhere(tmp_path, source):
+    area = _area_with(tmp_path, {"test_proof.py": source})
+
+    relaxed = _pytest([str(area)], tmp_path)
+    # (a module that skips at collection leaves nothing to run, which pytest reports as exit 5)
+    assert relaxed.returncode in (0, 5) and "1 skipped" in relaxed.stdout, relaxed.stdout + relaxed.stderr
+
+    gate = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert gate.returncode not in (0, 5), gate.stdout + gate.stderr
+    assert "skipped" not in gate.stdout.splitlines()[-1], gate.stdout
+    assert "NS_INTEGRATION_REQUIRED is set but a test was skipped" in gate.stdout, gate.stdout
+
+
+def test_an_expected_failure_is_not_turned_into_a_failure_by_the_skip_rule(tmp_path):
+    area = _area_with(tmp_path, {"test_x.py": "import pytest\n\n@pytest.mark.xfail(reason='known')\ndef test_x():\n    assert False\n"})
+    gate = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert gate.returncode == 0 and "1 xfailed" in gate.stdout, gate.stdout
+
+
+_CBM_TEST = (
+    "from integration_tests.cbm_gate import FAIL, SKIP, cbm_decision\nimport pytest\n\n"
+    "def test_cbm():\n"
+    "    action, reason = cbm_decision(lambda url: False)\n"
+    "    if action == FAIL:\n        pytest.fail(reason, pytrace=False)\n"
+    "    if action == SKIP:\n        pytest.skip(reason)\n"
+)
+
+
+def test_the_cbm_waiver_is_the_one_skip_the_gate_allows(tmp_path):
+    area = _area_with(tmp_path, {"test_cbm.py": _CBM_TEST}, copy_cbm_gate=True)
+    waived = _pytest(["-rs", str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1", "NS_INTEGRATION_WAIVE": "cbm"})
+    assert waived.returncode == 0 and "1 skipped" in waived.stdout, waived.stdout + waived.stderr
+    unwaived = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert unwaived.returncode != 0 and "NS_INTEGRATION_WAIVE=cbm" in unwaived.stdout, unwaived.stdout
+
+
+def test_a_skip_cannot_claim_a_waiver_the_profile_did_not_grant(tmp_path):
+    forged = "import pytest\n\ndef test_proof():\n    pytest.skip('[waived:cbm] pretending')\n"
+    area = _area_with(tmp_path, {"test_proof.py": forged})
+    gate = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1"})
+    assert gate.returncode != 0, gate.stdout
+    other = _pytest([str(area)], tmp_path, {"NS_INTEGRATION_REQUIRED": "1", "NS_INTEGRATION_WAIVE": "other"})
+    assert other.returncode != 0, other.stdout
 
 
 def test_async_pipeline_fails_when_required_and_skips_otherwise():

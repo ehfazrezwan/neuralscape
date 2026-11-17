@@ -623,6 +623,44 @@ def test_ingest_okf_bundle_stamps_source_ref_and_links():
     assert "references and relates to" in link_calls[0]["content"]
 
 
+def test_ingest_okf_bundle_counts_and_reports_failed_cross_links():
+    """A cross-link memory that cannot be stored is reported, not swallowed.
+
+    The import's outcome rule is unchanged (every concept ingested -> completed),
+    but the summary now says how many link memories failed and for which concept.
+    """
+    from ingest.okf_bundle import ingest_okf_bundle
+
+    class _LinkFailsService(_FakeIngestService):
+        def store_raw(self, **kwargs):
+            if kwargs.get("related_memory_ids"):
+                raise RuntimeError("qdrant said no: Bearer abc123token")
+            return super().store_raw(**kwargs)
+
+    summary = ingest_okf_bundle(
+        _LinkFailsService(),
+        files=BUNDLE_FILES,
+        bundle_uri="/artifacts/my_bundle.zip",
+        user_id="alice",
+    )
+    assert summary["links"] == 0
+    assert summary["link_failures"] == 1
+    assert [f["concept_id"] for f in summary["failed_links"]] == ["a"]
+    assert "abc123token" not in summary["failed_links"][0]["error"]
+    # What makes an import fail is untouched.
+    assert summary["failed"] == 0 and summary["status"] == "completed"
+
+
+def test_ingest_okf_bundle_reports_zero_link_failures_when_links_store():
+    from ingest.okf_bundle import ingest_okf_bundle
+
+    summary = ingest_okf_bundle(
+        _FakeIngestService(), files=BUNDLE_FILES, bundle_uri="/artifacts/my_bundle.zip", user_id="alice",
+    )
+    assert summary["links"] == 1
+    assert summary["link_failures"] == 0 and summary["failed_links"] == []
+
+
 def test_ingest_okf_bundle_preserves_artifact_download_url():
     from ingest.okf_bundle import ingest_okf_bundle
 

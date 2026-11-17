@@ -714,6 +714,39 @@ class TestStoreRawBatchTwoPass:
         assert results[0].id == results[1].id
         assert service._bump_times_derived.call_count == 1
 
+    def test_in_batch_same_text_different_category_stays_two_rows(self, service):
+        """The in-batch key follows the store-level rule: category is part of
+        the dedup identity, so identical text under two categories in ONE batch
+        is two rows (as it is written one at a time), not one absorbed row."""
+        text = "Prefers tabs over spaces in every editor"
+        items = [
+            {"content": text, "user_id": "ehfaz", "category": "preference"},
+            {"content": text, "user_id": "ehfaz", "category": "personal_fact"},
+        ]
+        service._find_by_content_hash = lambda **kw: None
+        service._bump_times_derived = MagicMock()
+        service._revive_if_tombstoned = MagicMock(return_value=False)
+
+        results = service.store_raw_batch(items)
+
+        assert service._memory.vector_store.insert.call_count == 2
+        assert len(results) == 2
+        assert results[0].id != results[1].id
+        assert [r.category for r in results] == ["preference", "personal_fact"]
+        service._bump_times_derived.assert_not_called()
+
+    def test_in_batch_same_text_same_category_still_collapses(self, service):
+        text = "Prefers tabs over spaces in every editor"
+        items = [{"content": text, "user_id": "ehfaz", "category": "preference"}] * 2
+        service._find_by_content_hash = lambda **kw: None
+        service._bump_times_derived = MagicMock()
+        service._revive_if_tombstoned = MagicMock(return_value=False)
+
+        results = service.store_raw_batch(items)
+
+        assert service._memory.vector_store.insert.call_count == 1
+        assert results[0].id == results[1].id
+
     def test_bad_item_skipped_without_blocking(self, service):
         service._find_by_content_hash = lambda **kw: None
         items = self._items(["Good fact one here", "Good fact two here"])
