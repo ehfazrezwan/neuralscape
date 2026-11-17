@@ -921,6 +921,13 @@ async def process_ingest_okf_bundle(ctx: dict, payload: dict) -> dict:
             [c["concept_id"] for c in result.get("failed_concepts", [])][:10],
         )
 
+    if result.get("link_failures"):
+        logger.warning(
+            "OKF bundle %s: %d cross-link memories failed to store (%s)",
+            filename, result["link_failures"],
+            [c["concept_id"] for c in result.get("failed_links", [])][:10],
+        )
+
     registry = ctx.get("extension_registry")
     if registry and result.get("memory_ids"):
         await registry.emit_event("memory_stored", {
