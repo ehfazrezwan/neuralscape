@@ -262,7 +262,7 @@ def test_the_full_cycle_through_the_routes(routing_on, installed, ledger):
 
     # A write accepted during the window reaches both engines (the ledger's vector stage calls project_apply).
     _register(ledger, rows, "m-new", "a newer memory about harbours")
-    switch.project_apply(TENANT, "m-new", text="a newer memory about harbours", user_id=ADMIN)
+    switch.project_apply(TENANT, "m-new", text="a newer memory about harbours", user_id=ADMIN, scope="global")
     ctx = switch_module._ctx(TENANT)
     assert engines["a"].get(ctx, "m-new") is not None and engines["b"].get(ctx, "m-new") is not None
 
@@ -276,7 +276,7 @@ def test_the_full_cycle_through_the_routes(routing_on, installed, ledger):
 
     # Reads are served by the flipped engine; a post-flip write is on it and not yet on the old one.
     _register(ledger, rows, "m-after", "a memory written after the flip about glaciers")
-    switch.project_apply(TENANT, "m-after", text="a memory written after the flip about glaciers", user_id=ADMIN)
+    switch.project_apply(TENANT, "m-after", text="a memory written after the flip about glaciers", user_id=ADMIN, scope="global")
     hits = switch.recall(ADMIN, "glaciers", 5)
     assert [h.record_id for h in hits][:1] == ["m-after"]
     assert engines["a"].get(ctx, "m-after") is None and engines["b"].get(ctx, "m-after") is not None
@@ -305,12 +305,12 @@ def test_a_late_projection_of_an_erased_record_leaves_the_engine_empty(installed
     switch, rows, engines = installed
     ctx = switch_module._ctx(TENANT)
     _register(ledger, rows, "m-erased", "text that must not come back")
-    switch.project_apply(TENANT, "m-erased", text="text that must not come back", user_id=ADMIN)
+    switch.project_apply(TENANT, "m-erased", text="text that must not come back", user_id=ADMIN, scope="global")
     assert engines["a"].get(ctx, "m-erased") is not None
     ledger.tombstone(TENANT, "m-erased", 1, "test_erasure")
     switch.project_remove(TENANT, "m-erased")
     assert engines["a"].get(ctx, "m-erased") is None
-    switch.project_apply(TENANT, "m-erased", text="text that must not come back", user_id=ADMIN, revision=1)
+    switch.project_apply(TENANT, "m-erased", text="text that must not come back", user_id=ADMIN, scope="global", revision=1)
     assert engines["a"].get(ctx, "m-erased") is None
 
 
@@ -318,6 +318,6 @@ def test_the_tombstone_guard_holds_even_when_the_engine_never_saw_the_record(ins
     switch, _rows, engines = installed
     ctx = switch_module._ctx(TENANT)
     ledger.tombstone(TENANT, "m-never", 3, "test_erasure")  # erased before it was ever projected
-    switch.project_apply(TENANT, "m-never", text="late text", user_id=ADMIN, revision=2)
-    switch.project_apply(TENANT, "m-never", text="late text", user_id=ADMIN, revision=3)
+    switch.project_apply(TENANT, "m-never", text="late text", user_id=ADMIN, scope="global", revision=2)
+    switch.project_apply(TENANT, "m-never", text="late text", user_id=ADMIN, scope="global", revision=3)
     assert engines["a"].get(ctx, "m-never") is None

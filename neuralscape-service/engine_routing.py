@@ -243,12 +243,15 @@ class Backend:
 @dataclass
 class CatchUpReport:
     copied: int = 0
+    relabeled: int = 0  # records already at this revision and text whose labels were corrected
+    unchanged: int = 0  # records already equal to canonical state: nothing was written
     tombstoned: int = 0
     superseded: int = 0
     replayed: int = 0
     conflicts: list[tuple[str, str, int]] = field(default_factory=list)
     repaired_dirty: int = 0
     unrepaired: int = 0  # dirty keys that need content and had no canonical state to copy
+    skipped: int = 0  # canonical keys the source listed but could not read (nothing was projected for them)
 
 
 class RoutingError(Exception):
@@ -560,13 +563,19 @@ class EngineRouter:
                 self._tombstone(adapter, state.tenant_id, state.record_id, state.revision)
                 report.tombstoned += 1
             else:
-                adapter.apply(
-                    ctx,
-                    EngineRecord(
-                        record_id=state.record_id, revision=state.revision, tenant_id=state.tenant_id,
-                        text=state.text, labels=state.labels,
-                    ),
+                wanted = EngineRecord(
+                    record_id=state.record_id, revision=state.revision, tenant_id=state.tenant_id,
+                    text=state.text, labels=tuple(state.labels),
                 )
+                held = adapter.get(ctx, state.record_id)
+                if held is not None and held.revision == wanted.revision and held.text == wanted.text:
+                    if tuple(held.labels) == wanted.labels:
+                        report.unchanged += 1  # already canonical: a second pass writes nothing
+                        return
+                    adapter.apply(ctx, wanted)  # same revision and text: only the labels differ
+                    report.relabeled += 1
+                    return
+                adapter.apply(ctx, wanted)
                 report.copied += 1
         except PortFailure as failure:
             if failure.code is InternalErrorCode.STALE_REVISION:
@@ -617,6 +626,7 @@ class EngineRouter:
         if source is not None:
             for state in source.states():
                 self._copy_state(shadow, state, report)
+            report.skipped = int(getattr(source, "skipped", 0) or 0)
             with self._state_lock:
                 self._needs_canonical_sync = False
         self._cursors.set(self._cursor_name, self._journal.head())
@@ -650,11 +660,22 @@ class EngineRouter:
         if self._phase is not RoutePhase.STEADY:
             raise RoutingError("backfill needs no open dual-write window")
         report = CatchUpReport()
-        for state in source.states():
-            self._copy_state(self._active.adapter, state, report)
-        if not report.conflicts:
-            self._active.synced = True
-        self._notify("backfilled", {"copied": report.copied, "tombstoned": report.tombstoned, "conflicts": len(report.conflicts)})
+        backend = self._active
+        try:
+            for state in source.states():
+                # One record at a time under the write lock: no live write can land between the engine's
+                # revision check and its write, so a newer revision is never overwritten with older labels.
+                with self._write_lock:
+                    if self._active is not backend:
+                        raise RoutingError("the serving engine changed during the backfill")
+                    self._copy_state(backend.adapter, state, report)
+        except BaseException:
+            backend.synced = False  # a run that failed part-way proves nothing: an earlier "synced" no longer holds
+            raise
+        report.skipped = int(getattr(source, "skipped", 0) or 0)
+        # Every run decides afresh: a later backfill that ends with conflicts withdraws an earlier clean one.
+        backend.synced = not report.conflicts
+        self._notify("backfilled", {"copied": report.copied, "relabeled": report.relabeled, "tombstoned": report.tombstoned, "conflicts": len(report.conflicts)})
         return report
 
     def flip(self, *, parity_check: Optional[Callable[[VectorStorePort, VectorStorePort], bool]] = None) -> int:
@@ -720,7 +741,7 @@ class EngineRouter:
             self._journal.trim_through(self._journal.head())  # what was replayed is no longer needed
             self._flip_seq = self._journal.head()
             generation = self._fence.advance()
-            self._notify("rolled_back", {"replayed": report.copied + report.tombstoned, "superseded": report.superseded})
+            self._notify("rolled_back", {"replayed": report.copied + report.relabeled + report.tombstoned, "superseded": report.superseded})
             return generation
 
     def release_rollback_target(self, reason: str = "explicit") -> Optional[dict[str, Any]]:

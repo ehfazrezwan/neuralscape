@@ -39,15 +39,105 @@ potential data-exposure event, not routine noise.
 """
 
 import logging
+import time
 
 from datetime import datetime, timezone
 
 from config import settings
 from schemas import MemoryVisibility
-from memory.groups import _build_group_id
+from memory.delete import _is_tombstoned  # the one tombstone check (either metadata depth)
+from memory.groups import _build_group_id, decode_group_id
 
 logger = logging.getLogger(__name__)
 
+# Row metadata key: episodes a correction superseded that could not be removed yet (retried later).
+SUPERSEDED_EPISODES_KEY = "graph_episode_superseded"
+# Row metadata key: set on a surviving sibling whose shared episode was removed, until its
+# re-enrichment into a fresh episode has run (the removed episode's uuid; cleared after).
+REENRICH_PENDING_KEY = "graph_reenrich_pending"
+REENRICH_PENDING_AT_KEY = "graph_reenrich_pending_at"  # epoch seconds the marker was set (the sweep waits out a live job)
+REENRICH_ATTEMPTS_KEY = "graph_reenrich_sweep_attempts"  # failed sweep dispatches of this marker (the cap stops them)
+SWEEP_MAX_ATTEMPTS = 5  # a row that failed this many sweeps moves to the slow lane (below); its marker stays
+# Slow lane for rows past the cap: retried only after a backoff that doubles with each further failure (a graph or
+# provider outage that outlasts the five fast tries must not strand the survivor's facts for good), and at most
+# SWEEP_CAPPED_PER_RUN of them per run, on top of ``limit``, so they never take a slot from a row still in the fast lane.
+SWEEP_CAPPED_BACKOFF_S = 3600.0
+SWEEP_CAPPED_BACKOFF_MAX_S = 86400.0
+SWEEP_CAPPED_PER_RUN = 1
+_METADATA_PARENTS = ("metadata", "metadata.metadata")  # a row may carry its metadata wrapped one level deeper
+_DELETED_CLEANUP_BACKOFF_S = (0.5, 1.5)  # waits between the removal attempts for a deleted memory's episode
+_REENRICH_ATTEMPTS = 3  # re-enrichments of one row that a concurrent edit may invalidate in a row
+# The ledger job that re-enriches one memory into a fresh episode (see legacy_jobs).
+GRAPH_REENRICH_OPERATION = "graph.reenrich"
+
+
+
+def ledger_reenrich_dispatch(producer):
+    """Survivor re-enrichment as a durable ledger job (``graph.reenrich``), keyed per memory and
+    removed episode so a repeated removal replays the same intent."""
+
+    def dispatch(job: dict):
+        return producer.accept_job(
+            operation=GRAPH_REENRICH_OPERATION,
+            payload={"memory_id": job["memory_id"]},
+            user_id=job["user_id"],
+            idempotency_key=f"graph-reenrich:{job['memory_id']}:{job['removed_episode']}",
+            visibility=job["visibility"],
+            project_id=job["project_id"],
+            workspace=job["workspace"],
+        )
+
+    return dispatch
+
+
+def queue_reenrich_dispatch(pool, loop):
+    """Survivor re-enrichment as a graph-queue job (``process_graph_reenrich``) on ``loop``.
+
+    Called from a worker thread it waits for the enqueue; called on ``loop`` itself it
+    schedules the enqueue (the marker on the row shows it until the job ran).
+    """
+    import asyncio
+
+    def dispatch(job: dict) -> None:
+        coro = pool.enqueue_job(
+            "process_graph_reenrich",
+            job["memory_id"],
+            _job_id=f"graph-reenrich:{job['memory_id']}:{job['removed_episode']}",
+            _queue_name=settings.graph_queue_name,
+        )
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            task = loop.create_task(coro)
+            memory_id = job["memory_id"]
+
+            def _enqueued(done) -> None:
+                # An enqueue that fails after the dispatch returned would otherwise surface only as an
+                # unretrieved task exception, without the memory it was for.
+                if done.cancelled():
+                    error: BaseException | None = asyncio.CancelledError()
+                else:
+                    error = done.exception()
+                if error is not None:
+                    queue_reenrich_dispatch.enqueue_failures += 1
+                    logger.warning(
+                        "Re-enrichment of memory=%s could not be enqueued (graph_reenrich_pending stays on "
+                        "the row; the graph worker's sweep retries it): %r",
+                        memory_id, error,
+                    )
+
+            task.add_done_callback(_enqueued)
+        else:
+            asyncio.run_coroutine_threadsafe(coro, loop).result(timeout=30)
+
+    return dispatch
+
+
+_SNAPSHOT_UNREADABLE = object()  # a post-enrichment row read that failed (distinct from a missing row)
+
+queue_reenrich_dispatch.enqueue_failures = 0  # same-loop enqueues that failed after dispatch returned
 
 
 class GraphReadError(RuntimeError):
@@ -72,6 +162,8 @@ class ProvenanceMixin:
         episode_name: str | None = None,
         episode_uuid: str | None = None,
         content: str | None = None,
+        support_aware: bool | None = None,
+        exclude_ids: tuple[str, ...] | None = None,
     ) -> dict:
         """Resolve a memory's Graphiti episode in ``group_id`` and expire
         everything it contributed: edges (soft), entity nodes (removed if
@@ -95,7 +187,27 @@ class ProvenanceMixin:
         could be found — this is not an error, just "nothing to cascade"
         (e.g. the write predates this fix, or the caller has none of the
         three identifiers). Never raises.
+
+        ``support_aware`` (default: ``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED``) replaces the
+        most-restrictive edge expiry with support-aware removal: an edge another live episode still supports keeps that support and
+        stays live; an edge whose last support was this episode is removed; an entity is
+        removed only when no edge or mention references it; every entity the episode
+        mentions has its summary cleared; all in one transaction.  If that transaction
+        fails, the legacy most-restrictive steps run instead (never less restrictive).
+
+        ``exclude_ids`` names the memory rows going away with this removal (the deleted or
+        migrated memory, and any batch it is deleted with).  Conversation extraction stamps
+        every fact it creates with the same episode, so in support-aware mode the episode may
+        still be recorded by surviving sibling rows.  It is removed anyway (a removed memory's
+        facts must not stay retrievable; facts other episodes support are kept), and every
+        surviving sibling is re-enriched into a fresh episode of its own through the durable
+        path (``survivors_reenriched``), so its facts return and the removed memory's do not.
+        Until that runs the siblings' facts may be absent (availability, never exposure).  If
+        the rows cannot be checked the removal still proceeds and no sibling is known.  With
+        ``None`` no row check is made.
         """
+        if support_aware is None:
+            support_aware = bool(getattr(settings, "graph_support_aware_removal_enabled", False))
         zero = {
             "resolved": False,
             "episode_uuid": None,
@@ -147,10 +259,38 @@ class ProvenanceMixin:
 
             resolved_uuid = found["uuid"]
             resolved_name = found.get("name")
+            survivors: list = []
+            if support_aware and exclude_ids is not None:
+                survivors = self._episode_survivors(
+                    resolved_uuid, resolved_name or episode_name, exclude_ids, group_id
+                ) or []
+            if support_aware:
+                counts = self._support_aware_episode_removal(group_id, [resolved_uuid])
+                if counts is not None:
+                    logger.info(
+                        "Support-aware removal of episode=%s group_id=%r: edges_removed=%d "
+                        "edges_kept=%d nodes_removed=%d summaries_cleared=%d",
+                        resolved_uuid, group_id, counts["edges_removed"], counts["edges_kept"],
+                        counts["nodes_removed"], counts["summaries_cleared"],
+                    )
+                    return {
+                        "resolved": True,
+                        "episode_uuid": resolved_uuid,
+                        "episode_name": resolved_name,
+                        "mode": "support_aware",
+                        "edges_expired": counts["edges_removed"],
+                        "edges_kept": counts["edges_kept"],
+                        "nodes_removed": counts["nodes_removed"],
+                        "summaries_cleared": counts["summaries_cleared"],
+                        "survivors_reenriched": self._reenrich_survivors(survivors, resolved_uuid),
+                    }
+
             now_iso = datetime.now(timezone.utc).isoformat()
             edges_expired = self._expire_episode_edges(group_id, resolved_uuid, now_iso)
             node_counts = self._clear_or_remove_episode_entities(resolved_uuid)
             self._delete_episode_node(resolved_uuid)
+            if survivors:  # the most-restrictive fallback removed the shared episode too
+                self._reenrich_survivors(survivors, resolved_uuid)
 
             logger.info(
                 "Episode cascade expired episode=%s group_id=%r: "
@@ -179,6 +319,8 @@ class ProvenanceMixin:
         *,
         group_id: str | None = None,
         memory_id: str = "",
+        removing: tuple[str, ...] = (),
+        whole_user: bool = False,
     ) -> dict:
         """Expire a memory's graph provenance: cascade first, legacy
         substring heuristic only as a last resort.
@@ -204,6 +346,12 @@ class ProvenanceMixin:
         that logged one debug-level line and moved on, so an operator
         polling task status saw a clean ``completed`` with no indication
         entire rows were never touched in the graph).
+
+        ``removing`` lists the other rows of a batch delete that cascades before it deletes the
+        rows, so siblings of one conversation do not keep each other's shared episode alive;
+        ``whole_user`` (every memory of the user goes) skips the row check altogether.  In
+        support-aware mode episodes an earlier correction could not remove
+        (``graph_episode_superseded``) are retried here as well.
         """
         metadata = mem.get("metadata", {}) or {}
         if isinstance(metadata.get("metadata"), dict):
@@ -216,12 +364,25 @@ class ProvenanceMixin:
                 visibility, owner, metadata.get("project_id"), metadata.get("workspace")
             )
 
+        exclude_ids = None
+        if memory_id and not whole_user:
+            exclude_ids = tuple(dict.fromkeys(i for i in (memory_id, *removing) if i))
         result = self._cascade_expire_episode(
             group_id,
             episode_uuid=metadata.get("graph_episode_uuid"),
             episode_name=metadata.get("graph_episode_name"),
             content=mem.get("memory", ""),
+            exclude_ids=exclude_ids,
         )
+        if memory_id or whole_user:
+            left = self._retire_row_superseded(mem, metadata, exclude_ids)
+            if left:
+                logger.warning(
+                    "Superseded graph episodes of memory=%s could not be removed: %s", memory_id, left,
+                )
+                # The current episode's removal stays "resolved" (its siblings are repaired from it), but
+                # the caller is told that older episodes of this row are still in the graph.
+                result = dict(result, superseded_unresolved=list(left))
         result = dict(result, memory_id=memory_id or None)
         if not result.get("resolved"):
             logger.warning(
@@ -240,6 +401,598 @@ class ProvenanceMixin:
                     memory_id or "?", e,
                 )
         return result
+
+    def _retire_row_superseded(self, mem: dict, metadata: dict, exclude_ids) -> list[str]:
+        """Retire the episodes an earlier correction of this row could not remove (support-aware mode only);
+        returns the ones still in the graph."""
+
+        superseded = metadata.get(SUPERSEDED_EPISODES_KEY)
+        if not (isinstance(superseded, list) and superseded
+                and getattr(settings, "graph_support_aware_removal_enabled", False)):
+            return []
+        return self._retire_episodes(
+            exclude_ids,
+            [u for u in superseded if isinstance(u, str)],
+            owner_user_id=metadata.get("owner_user_id") or mem.get("user_id") or None,
+        )
+
+    def _support_aware_episode_removal(self, group_id: str, episode_uuids: list[str]) -> dict | None:
+        """Remove episodes support-aware through the current-stack graph adapter; ``None`` on failure."""
+
+        try:
+            from engine_adapters_current import GraphitiGraphAdapter
+
+            adapter = GraphitiGraphAdapter(
+                self._graphiti, lambda coro: self._run_on_bridge(coro, timeout=30.0)
+            )
+            return adapter.remove_episodes(group_id, episode_uuids)
+        except Exception:
+            logger.warning(
+                "Support-aware graph removal failed for group_id=%r episodes=%s; "
+                "falling back to the most-restrictive cascade",
+                group_id, episode_uuids, exc_info=True,
+            )
+            return None
+
+    def _episode_survivors(
+        self,
+        episode_uuid: str,
+        episode_name: str | None,
+        exclude_ids: tuple[str, ...],
+        group_id: str | None = None,
+    ) -> list[tuple[str, dict]] | None:
+        """The memory rows outside ``exclude_ids`` that record this episode (by uuid or name).
+
+        An episode name is minted from a timestamp (or a content hash), so two groups can in
+        principle hold episodes of one name.  With ``group_id`` a row that records the episode by
+        name only counts when the group its own fields build is that group, so another
+        tenant's row is never re-enriched because of a name collision; a uuid is unique and
+        needs no such check.
+
+        Pages through the rows that reference the episode (the facts of one conversation, so
+        few; both reference fields carry a keyword payload index) and compares ids here, so a
+        large batch never becomes a large filter.  Returns ``(id, payload)`` pairs, or ``None``
+        when the row store cannot be asked.
+        """
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+
+        self._ensure_filter_indexes()
+        # A row may carry its metadata wrapped one level deeper (``metadata.metadata``): match both depths.
+        should = [
+            FieldCondition(key=f"{parent}.graph_episode_uuid", match=MatchValue(value=episode_uuid))
+            for parent in _METADATA_PARENTS
+        ]
+        if episode_name:
+            should += [
+                FieldCondition(key=f"{parent}.graph_episode_name", match=MatchValue(value=episode_name))
+                for parent in _METADATA_PARENTS
+            ]
+        excluded = set(exclude_ids)
+        survivors: list[tuple[str, dict]] = []
+        offset = None
+        try:
+            while True:
+                points, offset = self._memory.vector_store.client.scroll(
+                    collection_name=settings.qdrant_collection,
+                    scroll_filter=Filter(should=should),
+                    limit=64,
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False,
+                )
+                survivors += [
+                    (str(p.id), p.payload or {})
+                    for p in points
+                    if str(p.id) not in excluded
+                    and (group_id is None or self._row_records_episode_in_group(p.payload or {}, episode_uuid, group_id))
+                ]
+                if offset is None or not points:
+                    return survivors
+        except Exception:
+            logger.warning("Episode reference check failed for episode=%s", episode_uuid, exc_info=True)
+            return None
+
+    @staticmethod
+    def _row_records_episode_in_group(payload: dict, episode_uuid: str, group_id: str) -> bool:
+        """A row recording the episode by its uuid, or by name from the very group the episode lives in."""
+
+        meta = payload.get("metadata") or {}
+        if meta.get("graph_episode_uuid") == episode_uuid:
+            return True  # the reference is written at the outer depth, whatever the row's own depth
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+            if meta.get("graph_episode_uuid") == episode_uuid:
+                return True
+        row_group = _build_group_id(
+            meta.get("visibility") or MemoryVisibility.PRIVATE.value,
+            meta.get("owner_user_id") or payload.get("user_id") or "",
+            meta.get("project_id"),
+            meta.get("workspace"),
+        )
+        return row_group == group_id
+
+    def _reenrich_survivors(self, survivors: list[tuple[str, dict]], removed_episode: str) -> int:
+        """Re-enrich each surviving sibling of a removed shared episode into a fresh episode.
+
+        The row's reference to the removed episode is cleared and ``graph_reenrich_pending``
+        set (it stays until the re-enrichment ran, so a lost dispatch is visible and the
+        graph worker's sweep picks the row up), then one job per row goes through the durable
+        path installed for this process (a ledger job, or the graph enrichment queue); with
+        none installed the row is enriched inline.  The clearing is conditional on the row still
+        recording the removed episode (a store-side filter), so a correction that gave the row a
+        newer episode since the survivor lookup is never undone.  A tombstoned row is not
+        re-enriched.  Returns how many rows were scheduled.
+        """
+        from qdrant_client.models import (
+            FieldCondition, Filter, HasIdCondition, IsEmptyCondition, MatchValue, PayloadField,
+        )
+
+        scheduled = 0
+        failed = 0
+        client = self._memory.vector_store.client
+        for memory_id, payload in survivors:
+            outer = payload.get("metadata") or {}
+            wrapped = isinstance(outer.get("metadata"), dict)
+            meta = outer["metadata"] if wrapped else outer
+            parent = "metadata.metadata" if wrapped else "metadata"
+            if _is_tombstoned(payload):
+                continue
+            job = {
+                "memory_id": memory_id,
+                "content": payload.get("data", ""),
+                "user_id": meta.get("owner_user_id") or payload.get("user_id", ""),
+                "project_id": meta.get("project_id"),
+                "visibility": meta.get("visibility") or MemoryVisibility.PRIVATE.value,
+                "workspace": meta.get("workspace"),
+                "removed_episode": removed_episode,
+            }
+            # What the row recorded when it was read: the update applies only while that still holds.  The
+            # episode reference is looked for at the depth that holds it: ``_persist_graph_episode_ref``
+            # writes it at the outer metadata, even for a row whose metadata is wrapped one level deeper,
+            # while the row's own fields (and the re-enrichment marker the readers look for) sit at ``parent``.
+            ref_parent, ref_meta = parent, meta
+            for cand_parent, cand in (("metadata", outer), ("metadata.metadata", outer.get("metadata"))):
+                if isinstance(cand, dict) and cand.get("graph_episode_uuid") == removed_episode:
+                    ref_parent, ref_meta = cand_parent, cand
+                    break
+            else:
+                for cand_parent, cand in (("metadata", outer), ("metadata.metadata", outer.get("metadata"))):
+                    if isinstance(cand, dict) and cand.get("graph_episode_name") and not cand.get("graph_episode_uuid"):
+                        ref_parent, ref_meta = cand_parent, cand
+                        break
+            uuid_absent = None
+            if ref_meta.get("graph_episode_uuid") == removed_episode or not ref_meta.get("graph_episode_name"):
+                recorded = FieldCondition(
+                    key=f"{ref_parent}.graph_episode_uuid", match=MatchValue(value=removed_episode))
+            else:
+                # Name-only row: the update also needs the uuid to still be absent, so a concurrent write
+                # that added a uuid under the same name is not cleared.
+                recorded = FieldCondition(
+                    key=f"{ref_parent}.graph_episode_name", match=MatchValue(value=ref_meta["graph_episode_name"]))
+                uuid_absent = IsEmptyCondition(is_empty=PayloadField(key=f"{ref_parent}.graph_episode_uuid"))
+            only_if_recorded = Filter(must=[HasIdCondition(has_id=[memory_id]), recorded,
+                                            *([uuid_absent] if uuid_absent is not None else [])])
+            try:
+                marker = {REENRICH_PENDING_KEY: removed_episode,
+                          REENRICH_PENDING_AT_KEY: time.time(), REENRICH_ATTEMPTS_KEY: 0}
+                cleared = {"graph_episode_uuid": None, "graph_episode_name": None}
+                if ref_parent == parent:
+                    # Reference and marker at one depth: one conditional update.
+                    client.set_payload(
+                        collection_name=settings.qdrant_collection, payload={**cleared, **marker},
+                        points=only_if_recorded, key=parent,
+                    )
+                else:
+                    # The reference is at the other depth than the row's own fields.  The marker goes first,
+                    # at the row's own depth, and only while the row still records the removed episode; the
+                    # reference is cleared under the same condition after it.  A failure between the two
+                    # leaves a visible marker (the sweep retries) rather than a cleared reference with none.
+                    client.set_payload(
+                        collection_name=settings.qdrant_collection, payload=marker,
+                        points=only_if_recorded, key=parent,
+                    )
+                if not self._row_marked_for_reenrichment(memory_id, removed_episode):
+                    # The row no longer records the removed episode (a correction moved it on): nothing
+                    # of it is lost, and the row's own newer episode is left as it is.
+                    logger.info(
+                        "Memory=%s no longer records removed episode=%s; not re-enriching it",
+                        memory_id, removed_episode,
+                    )
+                    continue
+                if ref_parent != parent:
+                    client.set_payload(
+                        collection_name=settings.qdrant_collection, payload=cleared,
+                        points=only_if_recorded, key=ref_parent,
+                    )
+                dispatch = getattr(self, "_graph_reenrich_dispatch", None)
+                if dispatch is not None:
+                    dispatch(job)
+                else:
+                    self.reenrich_memory_graph(memory_id)
+                scheduled += 1
+            except Exception:
+                failed += 1
+                logger.warning(
+                    "Re-enrichment of memory=%s after removing its shared episode=%s could not be "
+                    "scheduled (graph_reenrich_pending stays on the row; the graph worker's sweep retries it)",
+                    memory_id, removed_episode, exc_info=True,
+                )
+        if scheduled or failed:
+            logger.info(
+                "Removed shared episode=%s; re-enriching %d surviving memories (%d could not be scheduled)",
+                removed_episode, scheduled, failed,
+            )
+        return scheduled
+
+    def _row_marked_for_reenrichment(self, memory_id: str, removed_episode: str) -> bool:
+        """Whether the row carries the re-enrichment marker for ``removed_episode`` (a conditional update applied)."""
+
+        points = self._memory.vector_store.client.retrieve(
+            collection_name=settings.qdrant_collection, ids=[memory_id], with_payload=True, with_vectors=False,
+        ) or []
+        for point in points:
+            meta = (getattr(point, "payload", None) or {}).get("metadata") or {}
+            if isinstance(meta.get("metadata"), dict) and meta["metadata"].get(REENRICH_PENDING_KEY):
+                meta = meta["metadata"]
+            if meta.get(REENRICH_PENDING_KEY) == removed_episode:
+                return True
+        return False
+
+    def sweep_pending_reenrichments(self, limit: int = 20, min_age_s: float = 600.0) -> dict:
+        """Re-run the re-enrichment of rows still marked ``graph_reenrich_pending`` (graph-worker cron).
+
+        A dispatch that was lost (queue or ledger down, a job that exhausted its tries) leaves the
+        marker on the row; this is its retry.  Bounded per run (``limit`` rows, each a full
+        enrichment); a row whose marker is younger than ``min_age_s`` is left to the job that may
+        still be running.  The marker is cleared by the enrichment itself once the new episode is
+        recorded; the one exception is a tombstoned row, whose marker is cleared here without any
+        enrichment (its text must not reach the graph; reviving the row later does not re-enrich it).  Only when ``GRAPH_SUPPORT_AWARE_REMOVAL_ENABLED`` is on (the marker
+        is only cleared then).
+        """
+        out = {"scanned": 0, "reenriched": 0, "failed": 0}
+        if not getattr(settings, "graph_support_aware_removal_enabled", False):
+            return out
+        from qdrant_client.models import Filter, IsEmptyCondition, PayloadField
+
+        client = self._memory.vector_store.client
+        # A marker is a payload key at either metadata depth; each depth is scrolled on its own.
+        filters = [
+            Filter(must_not=[IsEmptyCondition(is_empty=PayloadField(key=f"{parent}.{REENRICH_PENDING_KEY}"))])
+            for parent in _METADATA_PARENTS
+        ]
+        now = time.time()
+        # Every marked row is looked at (pending rows are few), then the oldest marker goes first: a row that
+        # failed has its marker time bumped, so rows behind it get their turn on the next run.
+        candidates: dict[str, tuple[float, int, bool]] = {}
+        for flt in filters:
+            offset = None
+            while True:
+                points, offset = client.scroll(
+                    collection_name=settings.qdrant_collection, scroll_filter=flt, limit=100,
+                    offset=offset, with_payload=True, with_vectors=False,
+                )
+                for point in points:
+                    meta = (point.payload or {}).get("metadata") or {}
+                    wrapped = isinstance(meta.get("metadata"), dict) and meta["metadata"].get(REENRICH_PENDING_KEY)
+                    if wrapped:
+                        meta = meta["metadata"]
+                    if not meta.get(REENRICH_PENDING_KEY):
+                        continue
+                    pid = str(point.id)
+                    if pid in candidates:
+                        continue
+                    out["scanned"] += 1
+                    at = float(meta.get(REENRICH_PENDING_AT_KEY) or 0)
+                    if now - at < min_age_s:
+                        continue
+                    candidates[pid] = (at, int(meta.get(REENRICH_ATTEMPTS_KEY) or 0), bool(wrapped))
+                if offset is None or not points:
+                    break
+        capped = sorted(pid for pid, (_, tries, _w) in candidates.items() if tries >= SWEEP_MAX_ATTEMPTS)
+        if capped:
+            out["capped"] = capped
+            logger.warning(
+                "Re-enrichment sweep: %d memories failed %d sweeps and are retried at a slower pace "
+                "(graph_reenrich_pending stays on the rows; the next write to each repairs it too): %s",
+                len(capped), SWEEP_MAX_ATTEMPTS, capped,
+            )
+        due = sorted(
+            (pid for pid, (_, tries, _w) in candidates.items() if tries < SWEEP_MAX_ATTEMPTS),
+            key=lambda pid: (candidates[pid][0], pid),
+        )[:limit]
+
+        def _backoff(tries: int) -> float:
+            return min(SWEEP_CAPPED_BACKOFF_S * 2 ** min(tries - SWEEP_MAX_ATTEMPTS, 10), SWEEP_CAPPED_BACKOFF_MAX_S)
+
+        # ``at`` of a failed row is the time of its last failed sweep, so "due" is a backoff since that failure.
+        slow = sorted(
+            (pid for pid in capped if now - candidates[pid][0] >= _backoff(candidates[pid][1])),
+            key=lambda pid: (candidates[pid][0], pid),
+        )[:SWEEP_CAPPED_PER_RUN]
+        due += slow
+        for memory_id in due:
+            try:
+                done = self.reenrich_memory_graph(memory_id)
+                if done.get("reason") == "memory_tombstoned":
+                    self._clear_reenrich_pending(memory_id)  # a logically deleted row needs no episode
+                out["reenriched"] += 0 if done.get("skipped") else 1
+            except Exception:
+                out["failed"] += 1
+                logger.warning(
+                    "Sweep re-enrichment of memory=%s failed; graph_reenrich_pending stays on the row",
+                    memory_id, exc_info=True,
+                )
+                self._bump_sweep_failure(memory_id, candidates[memory_id])
+        return out
+
+    def _bump_sweep_failure(self, memory_id: str, candidate: tuple[float, int, bool]) -> None:
+        """A failed sweep dispatch moves the row to the back of the queue and counts the failure.
+
+        The marker itself is left in place (a capped row is still repaired by the next write)."""
+
+        _, tries, wrapped = candidate
+        try:
+            self._memory.vector_store.client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload={REENRICH_PENDING_AT_KEY: time.time(), REENRICH_ATTEMPTS_KEY: tries + 1},
+                points=[memory_id],
+                key="metadata.metadata" if wrapped else "metadata",
+            )
+        except Exception:
+            logger.warning("Recording the failed sweep of memory=%s failed", memory_id, exc_info=True)
+
+    def set_graph_reenrich_dispatch(self, dispatch) -> None:
+        """Install the durable path for survivor re-enrichment (``dispatch(job)``; ``None``: inline)."""
+
+        self._graph_reenrich_dispatch = dispatch
+
+    def reenrich_memory_graph(self, memory_id: str) -> dict:
+        """Re-enrich one memory into a fresh episode (the ``graph.reenrich`` job).
+
+        A memory deleted meanwhile is skipped; an enrichment that does not complete raises, so
+        the job is retried.  The enrichment runs on a snapshot of the row (content, owner,
+        visibility, project, workspace); if an edit changed any of it meanwhile, the episode this
+        attempt wrote is removed (it may hold the old text, or sit in a group the row has left)
+        and the enrichment runs again on the current row, up to ``_REENRICH_ATTEMPTS`` times.
+        """
+        for _ in range(_REENRICH_ATTEMPTS):
+            row = self._memory.get(memory_id)
+            if not row:
+                return {"skipped": True, "reason": "memory_missing"}
+            meta = row.get("metadata") or {}
+            if isinstance(meta.get("metadata"), dict):
+                meta = meta["metadata"]
+            # ``Memory.get`` nests the payload's metadata one level deeper, so ``meta`` (once unwrapped) is the
+            # payload's own metadata: the shared check looks at it and at the metadata wrapped inside it.
+            if _is_tombstoned({"metadata": meta}):
+                return {"skipped": True, "reason": "memory_tombstoned"}
+            owner = meta.get("owner_user_id") or row.get("user_id", "")
+            visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
+            snapshot = self._enrichment_snapshot(row, meta)
+            marked = bool(meta.get(REENRICH_PENDING_KEY))
+            written: dict = {}
+            outcome: dict = {}
+            enriched = self.enrich_graph(
+                content=row.get("memory", ""),
+                user_id=owner,
+                project_id=meta.get("project_id"),
+                visibility=visibility,
+                memory_id=memory_id,
+                occurred_at=meta.get("occurred_at"),
+                workspace=meta.get("workspace"),
+                outcome=outcome,
+                result_out=written,
+                keep_reenrich_marker=True,  # cleared below, only once the row has been verified
+            )
+            if not enriched:
+                raise RuntimeError(f"graph re-enrichment of {memory_id} did not complete")
+            group_id = _build_group_id(visibility, owner, meta.get("project_id"), meta.get("workspace"))
+            episode_uuid = written.get("episode_uuid")
+            if not outcome.get("cleaned_up") and self._row_deleted_during_enrichment(memory_id):
+                # The survivor was deleted while its job extracted: the delete found no episode yet (the row
+                # carried none, the old one was removed), so the episode just written would keep the deleted
+                # text in the graph.  Remove it by uuid, as the graph enrichment job does for a deleted memory.
+                result = {"skipped": True, "reason": "memory_deleted_during_enrichment"}
+                stranded = self._remove_episode_of_deleted_memory(memory_id, group_id, written, row.get("memory", ""))
+                if stranded:
+                    result["unresolved_episodes"] = [stranded]
+                return result
+            if outcome.get("cleaned_up"):
+                return {"memory_ids": [memory_id]}
+            current = self._current_enrichment_snapshot(memory_id)
+            if current is _SNAPSHOT_UNREADABLE:
+                # The row cannot be re-read, so a scope change during the enrichment cannot be ruled out:
+                # take back the episode this attempt wrote (by uuid, in the group it was written to), keep
+                # the row marked and fail the job so it is retried.
+                self._remove_written_episode(memory_id, group_id, written, row.get("memory", ""), "unverified memory")
+                self._mark_reenrich_pending(memory_id, episode_uuid or written.get("episode_name") or "unverified")
+                raise RuntimeError(
+                    f"graph re-enrichment of {memory_id} could not verify the row after enrichment; "
+                    "the episode written was removed; will be retried"
+                )
+            if current is None or current == snapshot:
+                if marked and current is not None:
+                    self._clear_reenrich_pending(memory_id)  # verified: the new episode is the right one
+                return {"memory_ids": [memory_id]}
+            # The row changed under the enrichment: its text or its audience is no longer the one the
+            # episode was written for (a shared episode of a row now private would stay readable).
+            self._remove_written_episode(memory_id, group_id, written, row.get("memory", ""), "changed memory")
+            self._mark_reenrich_pending(memory_id, episode_uuid or written.get("episode_name") or "changed")
+            logger.info("Memory=%s changed during its re-enrichment; the episode written was removed", memory_id)
+        raise RuntimeError(f"graph re-enrichment of {memory_id} kept being invalidated by edits; will be retried")
+
+    @staticmethod
+    def _enrichment_snapshot(row: dict, meta: dict) -> tuple:
+        """What an enrichment's episode depends on: the text and the group it is written into."""
+
+        return (
+            row.get("memory", ""),
+            meta.get("owner_user_id") or row.get("user_id", ""),
+            meta.get("visibility") or MemoryVisibility.PRIVATE.value,
+            meta.get("project_id"),
+            meta.get("workspace"),
+            bool(meta.get("dream_tombstoned")),
+        )
+
+    def _current_enrichment_snapshot(self, memory_id: str):
+        """The snapshot of the row as stored now; ``None`` when the row is gone, ``_SNAPSHOT_UNREADABLE``
+        when the read failed (the caller cannot tell whether the row changed)."""
+
+        try:
+            row = self._memory.get(memory_id)
+        except Exception:
+            logger.warning("post-enrichment row read failed for %s", memory_id, exc_info=True)
+            return _SNAPSHOT_UNREADABLE
+        if not row:
+            return None
+        meta = row.get("metadata") or {}
+        if isinstance(meta.get("metadata"), dict):
+            meta = meta["metadata"]
+        return self._enrichment_snapshot(row, meta)
+
+    def _remove_written_episode(
+        self, memory_id: str, group_id: str, written: dict, content: str, what: str
+    ) -> None:
+        """Remove the episode one enrichment attempt wrote; raises when that did not resolve."""
+
+        episode_uuid = written.get("episode_uuid")
+        if episode_uuid:
+            removal = self._cascade_expire_episode(group_id, episode_uuid=episode_uuid)
+        else:
+            removal = self._cascade_expire_episode(
+                group_id, episode_name=written.get("episode_name"), content=content,
+            )
+        if not (isinstance(removal, dict) and removal.get("resolved")):
+            raise RuntimeError(
+                f"graph cleanup unresolved for {what} {memory_id}: group_id={group_id!r} "
+                f"episode_uuid={episode_uuid!r}; re-run the episode cascade for this group/episode"
+            )
+
+    def _remove_episode_of_deleted_memory(
+        self, memory_id: str, group_id: str, written: dict, content: str
+    ) -> dict | None:
+        """Remove the episode written for a memory that was deleted meanwhile, retrying a few times with a
+        short backoff.  A retried job cannot do it later (it finds no row, so it never learns the episode),
+        so a removal that still fails is reported here: logged at ERROR and returned (uuid, group) for the
+        job result.  Returns ``None`` when the episode is gone."""
+
+        last: Exception | None = None
+        for delay in (0.0, *_DELETED_CLEANUP_BACKOFF_S):
+            if delay:
+                time.sleep(delay)
+            try:
+                self._remove_written_episode(memory_id, group_id, written, content, "deleted memory")
+                return None
+            except Exception as exc:  # noqa: BLE001 - unresolved removal or a graph error: try again, then report
+                last = exc
+        stranded = {"episode_uuid": written.get("episode_uuid"), "group_id": group_id}
+        if not stranded["episode_uuid"]:
+            stranded["episode_name"] = written.get("episode_name")
+        logger.error(
+            "Episode written for deleted memory=%s could not be removed after %d attempts "
+            "(episode_uuid=%r episode_name=%r group_id=%r); it still holds the deleted text: %s",
+            memory_id, len(_DELETED_CLEANUP_BACKOFF_S) + 1, written.get("episode_uuid"),
+            written.get("episode_name"), group_id, last,
+        )
+        return stranded
+
+    def _mark_reenrich_pending(self, memory_id: str, episode: str) -> None:
+        """Put the row back to "awaiting re-enrichment" after an episode it pointed at was removed."""
+
+        try:
+            row = self._memory.get(memory_id) or {}
+            wrapped = isinstance((row.get("metadata") or {}).get("metadata"), dict)
+            self._memory.vector_store.client.set_payload(
+                collection_name=settings.qdrant_collection,
+                payload={"graph_episode_uuid": None, "graph_episode_name": None,
+                         REENRICH_PENDING_KEY: episode, REENRICH_PENDING_AT_KEY: time.time()},
+                points=[memory_id],
+                key="metadata.metadata" if wrapped else "metadata",
+            )
+        except Exception:
+            logger.warning("Marking memory=%s for re-enrichment failed", memory_id, exc_info=True)
+
+    def _episode_groups(self, episode_uuids: list[str]) -> dict[str, tuple[str, str | None]] | None:
+        """The group and name of each existing episode (missing ones are absent); ``None`` on failure."""
+
+        async def _run():
+            async with self._graphiti.driver.session() as session:
+                result = await session.run(
+                    "MATCH (e:Episodic) WHERE e.uuid IN $uuids "
+                    "RETURN e.uuid AS uuid, e.group_id AS group_id, e.name AS name",
+                    uuids=episode_uuids,
+                )
+                return await result.data()
+
+        coro = _run()
+        try:
+            records = self._run_on_bridge(coro, timeout=10.0) or []
+        except Exception:
+            coro.close()
+            logger.warning("Episode group lookup failed for %s", episode_uuids, exc_info=True)
+            return None
+        return {r["uuid"]: (r["group_id"], r.get("name")) for r in records}
+
+    @staticmethod
+    def _group_may_belong_to(group: str, owner_user_id: str | None) -> bool:
+        """Whether an episode in ``group`` may be one ``owner_user_id``'s memory wrote.
+
+        Shared and standard pools hold anyone's episodes; a private group names its owner, so another
+        user's private group is refused.  An injectively encoded private group names its owner too
+        (decoded here); a name that does not decode is not judged.
+        """
+
+        if not owner_user_id:
+            return True
+        key = decode_group_id(group)
+        if key is not None:  # an injectively encoded name carries its placement: judge the decoded owner
+            return key.pool != "private" or key.owner == owner_user_id
+        if group.startswith(("nsg1--", "shared", "standard")):
+            return True  # a name that does not decode is not judged here (legacy behaviour)
+        private = _build_group_id("private", owner_user_id)
+        return group == private or group.startswith(private + "--")
+
+    def _retire_episodes(
+        self,
+        exclude_ids: tuple[str, ...] | None,
+        episode_uuids: list[str],
+        owner_user_id: str | None = None,
+    ) -> list[str]:
+        """Support-aware removal of episodes the rows in ``exclude_ids`` no longer stand on.
+
+        Each episode is removed in the group it lives in (a correction may have moved the memory
+        to another group); an episode already gone is done.  An episode other memories still
+        record is removed as well and those memories are re-enriched into fresh episodes, as on
+        delete; if the rows cannot be checked the episode is still removed (fail closed) and no
+        sibling is known (``exclude_ids`` ``None``: no row check).  With ``owner_user_id`` an
+        episode that lives in another user's private group is left alone (a row never legitimately
+        records one; the check is defence in depth against a corrupted or forged row).  Returns the
+        episodes that could not be removed, for a later retry.
+        """
+        candidates = list(dict.fromkeys(u for u in episode_uuids if u))
+        if not candidates:
+            return []
+        groups = self._episode_groups(candidates)
+        if groups is None:
+            return candidates
+        left = []
+        for episode in candidates:
+            if episode not in groups:
+                continue
+            group, name = groups[episode]
+            if not self._group_may_belong_to(group, owner_user_id):
+                logger.warning(
+                    "Not retiring episode=%s: it lives in group_id=%r, which is not the owner's", episode, group,
+                )
+                continue
+            survivors = (
+                [] if exclude_ids is None else (self._episode_survivors(episode, name, exclude_ids, group) or [])
+            )
+            if self._support_aware_episode_removal(group, [episode]) is None:
+                left.append(episode)
+                continue
+            self._reenrich_survivors(survivors, episode)
+        return left
 
     def _persist_graph_episode_ref(
         self,
@@ -373,14 +1126,28 @@ class ProvenanceMixin:
                     hit = covered[(group, ref)]
                     break
             if hit is not None:
-                results[mid] = dict(hit, memory_id=mid or None)
+                # The current episode is already gone (one cascade for all rows that share it), but the
+                # episodes THIS row's earlier corrections left behind are its own: retire them here.
+                shared = {k: v for k, v in hit.items() if k != "superseded_unresolved"}
+                shared["memory_id"] = mid or None
+                if mid:
+                    left = self._retire_row_superseded(
+                        mem, meta, tuple(dict.fromkeys(i for i in (mid, *sorted(deleted)) if i)))
+                    if left:
+                        shared["superseded_unresolved"] = list(left)
+                        unresolved.append(mid)
+                results[mid] = shared
                 continue
 
             try:
+                # The batch's own rows are going away with this one: they must not count as survivors of a
+                # shared episode (a sibling that still exists would keep it live and unrepaired).
+                removing = tuple(sorted(deleted))
                 if pinned_group:
-                    res = self._cascade_or_fallback_expire(mem, group_id=pinned_group, memory_id=mid)
+                    res = self._cascade_or_fallback_expire(
+                        mem, group_id=pinned_group, memory_id=mid, removing=removing)
                 else:
-                    res = self._cascade_or_fallback_expire(mem, memory_id=mid)
+                    res = self._cascade_or_fallback_expire(mem, memory_id=mid, removing=removing)
             except Exception as e:
                 logger.warning(f"Graph cascade failed for {mid} (non-critical): {e}")
                 res = {"resolved": False, "memory_id": mid or None}
@@ -388,6 +1155,8 @@ class ProvenanceMixin:
             if not res.get("resolved"):
                 unresolved.append(mid)
                 continue
+            if res.get("superseded_unresolved"):
+                unresolved.append(mid)  # reported; the current episode's siblings are still repaired below
             refs = {r for r in (row_uuid, row_name, res.get("episode_uuid"), res.get("episode_name")) if r}
             for ref in refs:
                 covered[(group, ref)] = res
@@ -530,7 +1299,7 @@ class ProvenanceMixin:
             siblings = [t for t in siblings if t[0] not in failed]
 
         for sid, payload, meta, _ in siblings:
-            if sid in skip_job_ids or meta.get("dream_tombstoned"):
+            if sid in skip_job_ids or _is_tombstoned(payload):
                 continue  # tombstoned rows are not live: ref cleared, no re-ingest
             content = payload.get("data") or ""
             workspace = meta.get("workspace")
