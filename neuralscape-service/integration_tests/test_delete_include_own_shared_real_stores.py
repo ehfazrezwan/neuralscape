@@ -150,6 +150,46 @@ def _seed(svc, unique_ns):
         )
         return out[0].id
 
+    def store_with_live_edges(uid, texts, visibility, scope="project"):
+        """Store a row whose episode really produced a live edge in its own group.
+
+        The delete assertions below are non-vacuous only if the rows they must leave
+        untouched carry live edges, but the edges are extracted by the model: a plain
+        statement can come back with an entity or two and no relation. Try each phrasing
+        in turn (every attempt is a real write through the product path); when none
+        yields an edge, fail with what each attempt left in the graph, not a bare
+        assertion on an empty set.
+        """
+        attempts = []
+        for text in texts:
+            row_id = store(uid, text, visibility, scope)
+            ep = _episode_uuid(svc, row_id)
+            if not ep:
+                attempts.append({"text": text, "row": row_id, "episode": None})
+                continue
+            group = _stored_group(svc, row_id)
+            if _live_edge_uuids(svc, group, ep):
+                return row_id
+            if visibility == "standard":
+                # The standard group is org-wide: a discarded attempt must not leave its
+                # episode behind for other runs (own-footprint removal only).
+                unique_ns.on_cleanup(lambda ep=ep: _delete_episode_footprint(svc, ep))
+            attempts.append({
+                "text": text, "row": row_id, "episode": ep, "group": group,
+                "mentions": _cypher(
+                    svc, "MATCH (:Episodic {uuid:$u})-[:MENTIONS]->(n:Entity) RETURN n.name AS name", u=ep),
+                "episode_entity_edges": _cypher(
+                    svc, "MATCH (e:Episodic {uuid:$u}) RETURN e.entity_edges AS ee", u=ep),
+                "group_edges": _cypher(
+                    svc, "MATCH ()-[r:RELATES_TO {group_id:$g}]->() RETURN r.uuid AS uuid, "
+                    "r.fact AS fact, r.episodes AS episodes, r.invalid_at AS invalid_at, "
+                    "r.expired_at AS expired_at", g=group),
+            })
+        raise AssertionError(
+            f"no phrasing produced a live edge for a {visibility!r} row of {uid!r}; the model "
+            f"extracted entities but no relation (or the edge was expired at once). Attempts: {attempts!r}"
+        )
+
     ids = {
         "private": store(me, "The Quillfeather billing service deploys on Fridays.", "private"),
         "shared": store(me, "The Quillfeather team standup is at nine every weekday.", "shared"),
@@ -157,9 +197,17 @@ def _seed(svc, unique_ns):
         # this row's episode lands in the org-wide ``standard`` group (not a group
         # named after the test). The test therefore touches only what THIS episode
         # produced there (see _delete_episode_footprint), never the whole group.
-        "standard": store(me, "All Quillfeather services must expose a health endpoint.", "standard",
-                          scope="global"),
-        "others_shared": store(other, "The Quillfeather release notes live in the wiki.", "shared"),
+        "standard": store_with_live_edges(
+            me,
+            ["All Quillfeather services must expose a health endpoint.",
+             "Every Quillfeather service must expose a health endpoint at the path /healthz."],
+            "standard", scope="global"),
+        "others_shared": store_with_live_edges(
+            other,
+            ["The Quillfeather release notes live in the wiki.",
+             "Mara Okonkwo publishes the Quillfeather release notes in the Quillfeather wiki.",
+             "The Quillfeather release notes are published in the Atlas wiki by Mara Okonkwo."],
+            "shared"),
     }
     episodes = {k: _episode_uuid(svc, v) for k, v in ids.items()}
     missing = [k for k, v in episodes.items() if not v]
