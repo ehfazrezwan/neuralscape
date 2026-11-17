@@ -66,31 +66,42 @@ RUN rm -f evidence_*.py persona_*.py portability_verifier.py
 # ── Stage 2: Runtime ────────────────────────────────────────────
 FROM python:3.12-slim AS runtime
 
+# Non-root user created first so COPY --chown can assign ownership while
+# files are written, instead of a recursive chown layer that duplicates every
+# file into a new image layer. COPY-created implicit parent directories are
+# root-owned, so the application directories are pre-created and chowned
+# (non-recursively) here.
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app/neuralscape-service /app/graphiti /app/mem0 \
+        /data/qdrant /data/vault /data/ingest /data/exemplars && \
+    chown appuser:appuser /app /app/neuralscape-service /app/graphiti /app/mem0 \
+        /data /data/qdrant /data/vault /data/ingest /data/exemplars
+
 WORKDIR /app
 
 # Copy the virtual environment from builder
-COPY --from=builder /app/neuralscape-service/.venv /app/neuralscape-service/.venv
+COPY --chown=appuser:appuser --from=builder /app/neuralscape-service/.venv /app/neuralscape-service/.venv
 
 # Copy source code
-COPY graphiti/graphiti_core/ graphiti/graphiti_core/
-COPY graphiti/pyproject.toml graphiti/
-COPY mem0/mem0/ mem0/mem0/
-COPY mem0/pyproject.toml mem0/
-COPY --from=runtime-src /src/ neuralscape-service/
-COPY neuralscape-service/memory/ neuralscape-service/memory/
-COPY neuralscape-service/extensions/ neuralscape-service/extensions/
-COPY neuralscape-service/adapters/ neuralscape-service/adapters/
-COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
-COPY neuralscape-service/ingest/ neuralscape-service/ingest/
-COPY neuralscape-service/connectors/ neuralscape-service/connectors/
-COPY neuralscape-service/okf/ neuralscape-service/okf/
-COPY neuralscape-service/supabase/ neuralscape-service/supabase/
-COPY neuralscape-service/ledger/ neuralscape-service/ledger/
+COPY --chown=appuser:appuser graphiti/graphiti_core/ graphiti/graphiti_core/
+COPY --chown=appuser:appuser graphiti/pyproject.toml graphiti/
+COPY --chown=appuser:appuser mem0/mem0/ mem0/mem0/
+COPY --chown=appuser:appuser mem0/pyproject.toml mem0/
+COPY --chown=appuser:appuser --from=runtime-src /src/ neuralscape-service/
+COPY --chown=appuser:appuser neuralscape-service/memory/ neuralscape-service/memory/
+COPY --chown=appuser:appuser neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY --chown=appuser:appuser neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY --chown=appuser:appuser neuralscape-service/knowledge/ neuralscape-service/knowledge/
+COPY --chown=appuser:appuser neuralscape-service/ingest/ neuralscape-service/ingest/
+COPY --chown=appuser:appuser neuralscape-service/connectors/ neuralscape-service/connectors/
+COPY --chown=appuser:appuser neuralscape-service/okf/ neuralscape-service/okf/
+COPY --chown=appuser:appuser neuralscape-service/supabase/ neuralscape-service/supabase/
+COPY --chown=appuser:appuser neuralscape-service/ledger/ neuralscape-service/ledger/
 # Operator-facing scripts (relocate_vault_to_raw, issue_user_token,
 # migrate_graph_groups, bulk_promote_visibility). Production operators
 # invoke these in-container; without this copy they had to docker-cp
 # them in by hand.
-COPY neuralscape-service/scripts/ neuralscape-service/scripts/
+COPY --chown=appuser:appuser neuralscape-service/scripts/ neuralscape-service/scripts/
 
 # Put venv on PATH
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
@@ -106,9 +117,7 @@ ENV MEM0_TELEMETRY=false \
 
 WORKDIR /app/neuralscape-service
 
-# Run as non-root user
-RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data/qdrant /data/vault /data/ingest /data/exemplars && chown -R appuser:appuser /data /app
+# Run as non-root user (created and given ownership at the top of this stage)
 USER appuser
 
 EXPOSE 8199
@@ -128,26 +137,40 @@ FROM python:3.12-slim AS test
 
 COPY --from=ghcr.io/astral-sh/uv:0.13.6@sha256:af22a52f5eafef3d78e551599d405c02df61919d18028f0cea8eda93bc9986d0 /uv /uvx /bin/
 
+# Non-root user created first so COPY --chown can assign ownership while
+# files are written, instead of a recursive chown layer that duplicates every
+# file into a new image layer. COPY-created implicit parent directories are
+# root-owned, so the application directories are pre-created and chowned
+# (non-recursively) here.
+RUN useradd -m -u 1000 appuser && \
+    mkdir -p /app/neuralscape-service /app/graphiti /app/mem0 \
+        /data/qdrant /data/vault /data/ingest /data/exemplars && \
+    chown appuser:appuser /app /app/neuralscape-service /app/graphiti /app/mem0 \
+        /data /data/qdrant /data/vault /data/ingest /data/exemplars
+
+# Install and run as the service user so the venv is created appuser-owned
+# (uv cache lands in /home/appuser/.cache).
+USER appuser
 WORKDIR /app
 
 # Reuse the same dependency-resolution copy pattern as the builder.
-COPY graphiti/pyproject.toml graphiti/uv.lock graphiti/README.md graphiti/
-COPY mem0/pyproject.toml mem0/poetry.lock mem0/README.md mem0/LICENSE mem0/
-COPY neuralscape-service/pyproject.toml neuralscape-service/uv.lock neuralscape-service/
+COPY --chown=appuser:appuser graphiti/pyproject.toml graphiti/uv.lock graphiti/README.md graphiti/
+COPY --chown=appuser:appuser mem0/pyproject.toml mem0/poetry.lock mem0/README.md mem0/LICENSE mem0/
+COPY --chown=appuser:appuser neuralscape-service/pyproject.toml neuralscape-service/uv.lock neuralscape-service/
 
 # Source packages needed for editable installs.
-COPY graphiti/graphiti_core/ graphiti/graphiti_core/
-COPY mem0/mem0/ mem0/mem0/
-COPY neuralscape-service/*.py neuralscape-service/
-COPY neuralscape-service/memory/ neuralscape-service/memory/
-COPY neuralscape-service/extensions/ neuralscape-service/extensions/
-COPY neuralscape-service/adapters/ neuralscape-service/adapters/
-COPY neuralscape-service/knowledge/ neuralscape-service/knowledge/
-COPY neuralscape-service/ingest/ neuralscape-service/ingest/
-COPY neuralscape-service/connectors/ neuralscape-service/connectors/
-COPY neuralscape-service/okf/ neuralscape-service/okf/
-COPY neuralscape-service/supabase/ neuralscape-service/supabase/
-COPY neuralscape-service/ledger/ neuralscape-service/ledger/
+COPY --chown=appuser:appuser graphiti/graphiti_core/ graphiti/graphiti_core/
+COPY --chown=appuser:appuser mem0/mem0/ mem0/mem0/
+COPY --chown=appuser:appuser neuralscape-service/*.py neuralscape-service/
+COPY --chown=appuser:appuser neuralscape-service/memory/ neuralscape-service/memory/
+COPY --chown=appuser:appuser neuralscape-service/extensions/ neuralscape-service/extensions/
+COPY --chown=appuser:appuser neuralscape-service/adapters/ neuralscape-service/adapters/
+COPY --chown=appuser:appuser neuralscape-service/knowledge/ neuralscape-service/knowledge/
+COPY --chown=appuser:appuser neuralscape-service/ingest/ neuralscape-service/ingest/
+COPY --chown=appuser:appuser neuralscape-service/connectors/ neuralscape-service/connectors/
+COPY --chown=appuser:appuser neuralscape-service/okf/ neuralscape-service/okf/
+COPY --chown=appuser:appuser neuralscape-service/supabase/ neuralscape-service/supabase/
+COPY --chown=appuser:appuser neuralscape-service/ledger/ neuralscape-service/ledger/
 
 # Resolve WITH dev deps so pytest, pytest-asyncio, etc. are available.
 # E2: include the code-graph extra so in-container tests can import tree-sitter
@@ -155,7 +178,7 @@ RUN cd neuralscape-service && uv sync --frozen --extra code-graph
 
 # Same spaCy model handling as the runtime stage so unit tests that
 # import mem0's NLP path see the same dependency graph as production.
-COPY neuralscape-service/vendor/ neuralscape-service/vendor/
+COPY --chown=appuser:appuser neuralscape-service/vendor/ neuralscape-service/vendor/
 RUN cd neuralscape-service && \
     set -- vendor/en_core_web_sm-*.whl; \
     if [ -f "$1" ]; then \
@@ -169,18 +192,21 @@ RUN cd neuralscape-service && \
 # a host bind-mount. Bind-mounts can still be layered on top from compose
 # for faster iteration; the baked-in copy guarantees the image is
 # reproducibly testable on its own.
-COPY neuralscape-service/tests/ neuralscape-service/tests/
-COPY neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
-COPY neuralscape-service/scripts/ neuralscape-service/scripts/
+COPY --chown=appuser:appuser neuralscape-service/tests/ neuralscape-service/tests/
+# Test-stage only (the runtime image does not carry it): tests that assert on
+# the Dockerfile itself read it from here.
+COPY --chown=appuser:appuser neuralscape-service/Dockerfile neuralscape-service/Dockerfile
+COPY --chown=appuser:appuser neuralscape-service/integration_tests/ neuralscape-service/integration_tests/
+COPY --chown=appuser:appuser neuralscape-service/scripts/ neuralscape-service/scripts/
 # The repo-level group-id migration is exercised against real Neo4j by
 # integration_tests/test_migrate_group_ids_neo4j.py. Copy just that file, into
 # integration_tests/ (NOT a repo-level /app/scripts/: other tests treat the
 # presence of that directory as "full checkout" and would then run host-only
 # checks). Test stage only; the runtime image never gets it.
-COPY scripts/migrate-group-ids.cypher neuralscape-service/integration_tests/repo_scripts/migrate-group-ids.cypher
+COPY --chown=appuser:appuser scripts/migrate-group-ids.cypher neuralscape-service/integration_tests/repo_scripts/migrate-group-ids.cypher
 # The env templates (no secrets) are test inputs: tests/test_env_templates.py loads
 # each as the service .env.
-COPY .env.example .env.production ./
+COPY --chown=appuser:appuser .env.example .env.production ./
 
 ENV PATH="/app/neuralscape-service/.venv/bin:$PATH"
 ENV NEO4J_URI=neo4j://neo4j:7687 \
@@ -191,11 +217,8 @@ ENV NEO4J_URI=neo4j://neo4j:7687 \
 
 WORKDIR /app/neuralscape-service
 
-# Same non-root user pattern as runtime, so file-permission behavior
-# during tests mirrors production.
-RUN useradd -m -u 1000 appuser && \
-    mkdir -p /data/qdrant /data/vault /data/ingest /data/exemplars && chown -R appuser:appuser /data /app
-USER appuser
+# Already running as appuser (set before the dependency install), so
+# file-permission behavior during tests mirrors production.
 
 # Default to running the full suite minus the integration tests that
 # require a live ARQ worker. Compose overrides this via `command:`.

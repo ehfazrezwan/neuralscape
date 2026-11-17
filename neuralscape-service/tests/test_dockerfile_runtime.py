@@ -145,6 +145,9 @@ def test_only_the_runtime_stage_prunes_modules() -> None:
     if not DOCKERFILE.is_file():
         return
     text = DOCKERFILE.read_text(encoding="utf-8")
+    # The runtime and test stages set ownership at COPY time; the flag is not
+    # what this test is about, so compare the instructions without it.
+    text = re.sub(r"(?m)^COPY --chown=\S+ ", "COPY ", text)
     assert text.count("COPY neuralscape-service/*.py") == 3, "builder, runtime-src and test each copy every module"
     runtime = text[text.index("AS runtime\n") : text.index("AS test\n")]
     assert "COPY --from=runtime-src /src/ neuralscape-service/" in runtime
