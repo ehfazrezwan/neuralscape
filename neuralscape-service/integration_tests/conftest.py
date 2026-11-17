@@ -82,6 +82,73 @@ def integration_required() -> bool:
     return os.environ.get("NS_INTEGRATION_REQUIRED", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
+# --------------------------------------------------------------------------
+# a skip on the gate is a failure (mechanical, not per test)
+# --------------------------------------------------------------------------
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_WAIVER_TAG = re.compile(r"\[waived:([a-z0-9_-]+)\]")
+
+
+def gate_forbids_skips() -> bool:
+    """True when ``NS_INTEGRATION_REQUIRED`` is set (the gate): no test here may end skipped.
+
+    Only the explicit variable counts (not ``GITHUB_ACTIONS``): the gate is the run that is
+    meant to prove every flag-on path, and CI jobs that name a file keep their own skip rules.
+    """
+
+    return os.environ.get("NS_INTEGRATION_REQUIRED", "").strip().lower() in _TRUTHY
+
+
+def waiver_tag(dependency: str) -> str:
+    """The marker a deliberately waived skip carries in its reason (see ``cbm_gate``)."""
+
+    return f"[waived:{dependency.lower()}]"
+
+
+def _skip_is_waived(reason: str) -> bool:
+    """A skip the gate allows: it names a dependency the profile waived via ``NS_INTEGRATION_WAIVE``."""
+
+    waived = {n.strip().lower() for n in os.environ.get("NS_INTEGRATION_WAIVE", "").split(",") if n.strip()}
+    return any(name in waived for name in _WAIVER_TAG.findall(reason))
+
+
+def _skip_reason(longrepr: Any) -> str:
+    if isinstance(longrepr, tuple) and len(longrepr) == 3:
+        return str(longrepr[2]).removeprefix("Skipped: ")
+    return str(longrepr)
+
+
+def _fail_skip(report) -> None:
+    reason = redact(_skip_reason(report.longrepr))
+    if _skip_is_waived(reason):
+        return
+    report.outcome = "failed"
+    report.longrepr = (
+        f"NS_INTEGRATION_REQUIRED is set but a test was skipped: {reason}. "
+        "A required proof must run: fix the missing dependency, or waive it by name "
+        "with NS_INTEGRATION_WAIVE where a gate profile deliberately lacks it."
+    )
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.skipped and not hasattr(report, "wasxfail") and gate_forbids_skips():
+        _fail_skip(report)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_make_collect_report(collector):
+    """Module-level ``importorskip`` / ``skip(allow_module_level=True)`` skip at collection."""
+
+    outcome = yield
+    report = outcome.get_result()
+    if report.skipped and gate_forbids_skips():
+        _fail_skip(report)
+
+
 _USERINFO = re.compile(r"(?P<scheme>[A-Za-z][A-Za-z0-9+.\-]*://)(?P<user>[^/:@\s]*):(?P<password>[^/@\s]*)@")
 
 

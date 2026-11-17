@@ -53,6 +53,10 @@ in a gate run must be justified in the PR body, and a test may skip only on a
 declared condition (for example an optional extra that is not installed), never
 for missing stores, keys or API. A cleanup that fails in `unique_ns` fails the
 test's teardown.
+This is enforced by `conftest.py`, not left to each test: under `NS_INTEGRATION_REQUIRED=1`
+any skip (a direct `pytest.skip`, a `skipif`/`skip` marker, a skip inside a fixture, a
+module-level `importorskip`) is reported as a failure. The one exception is a skip whose reason
+carries the `[waived:<name>]` tag for a dependency named in `NS_INTEGRATION_WAIVE`.
 
 **Declared exception: CBM.** The cbm-bridge is not in the standard store stack. A gate profile that does not run it sets `NS_INTEGRATION_WAIVE=cbm`, and the CBM flag-on test then skips (the one allowed skip, visible in the output). A profile that runs the bridge sets `CBM_BRIDGE_URL` and waives nothing; an unreachable bridge there fails. Store URLs in messages and reprs have their passwords redacted.
 
