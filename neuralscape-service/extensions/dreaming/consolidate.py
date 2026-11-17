@@ -76,6 +76,9 @@ class ActionResult:
     applied: list[dict] = field(default_factory=list)
     reported: list[dict] = field(default_factory=list)   # shadow trial: not applied
     errors: list[str] = field(default_factory=list)
+    # Staged actions not applied because the rows changed under the sweep
+    # (e.g. a MERGE row was tombstoned after staging). Not errors.
+    skipped: list[dict] = field(default_factory=list)
 
 
 # ── Pool enumeration + LIGHT staging ────────────────────────────────
@@ -509,6 +512,32 @@ async def apply_actions(
                 result.applied.append({**act, "dry_run": True})
                 continue
             a_type = act["type"]
+            # Re-read the tombstone state of every row this action writes to,
+            # right before applying: another writer (semantic dedup) may have
+            # tombstoned one since the action was staged, and writing into a
+            # hidden row (a reframe, a merge) or re-tombstoning it (overwriting
+            # dedup's superseded_by pointer) would undo or bury dedup's work.
+            # The one exemption is the hard delete of a gate-cleared secret.
+            if not (
+                a_type == "prune"
+                and act.get("contains_secret")
+                and not act.get("secret_claim_downgraded")
+            ):
+                touched = list(dict.fromkeys([
+                    *(act.get("memory_ids") or []),
+                    *([act["survivor_id"]] if a_type == "merge" else []),
+                    # an invalidate points its rows at the row that replaces them
+                    *([act["superseded_by_id"]]
+                      if a_type == "invalidate" and act.get("superseded_by_id") else []),
+                ]))
+                hidden = await asyncio.to_thread(_tombstoned_ids, service, touched)
+                if hidden:
+                    result.skipped.append({
+                        "type": a_type,
+                        "memory_ids": list(act.get("memory_ids") or []),
+                        "skip_reason": "tombstoned since staging: " + ",".join(sorted(hidden)),
+                    })
+                    continue
             if a_type == "merge":
                 survivor = act["survivor_id"]
                 losers = [m for m in act["memory_ids"] if m != survivor]
@@ -789,6 +818,26 @@ def _times_derived_of(meta: dict | None) -> int:
         return max(1, int((meta or {}).get("times_derived") or 1))
     except (TypeError, ValueError):
         return 1
+
+
+def _tombstoned_ids(service, memory_ids: list[str]) -> set[str]:
+    """Ids among ``memory_ids`` whose live row is currently tombstoned (either metadata level)."""
+    from config import settings as core_settings
+
+    client = service._memory.vector_store.client
+    points = client.retrieve(
+        collection_name=core_settings.qdrant_collection,
+        ids=list(memory_ids),
+        with_payload=True,
+        with_vectors=False,
+    )
+    hidden: set[str] = set()
+    for pt in points or []:
+        meta = (getattr(pt, "payload", None) or {}).get("metadata") or {}
+        inner = meta.get("metadata") if isinstance(meta.get("metadata"), dict) else {}
+        if meta.get("dream_tombstoned") or inner.get("dream_tombstoned"):
+            hidden.add(str(getattr(pt, "id", "")))
+    return hidden
 
 
 def _sum_times_derived(service, memory_ids: list[str]) -> int:

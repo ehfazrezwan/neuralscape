@@ -36,9 +36,37 @@ def _make_hit(id, score, payload):
     return hit
 
 
+class _UpRedis:
+    """A Redis that always answers and holds no foreign lock: dedup takes its pool locks
+    on it (it does nothing destructive without Redis, so these tests need one)."""
+
+    def __init__(self):
+        self.keys: dict[str, str] = {}
+
+    def ping(self):
+        return True
+
+    def set(self, key, value, nx=False, px=None):
+        if nx and key in self.keys:
+            return None
+        self.keys[key] = value
+        return True
+
+    def get(self, key):
+        return self.keys.get(key)
+
+    def delete(self, key):
+        self.keys.pop(key, None)
+
+    def pexpire(self, key, ms):
+        return 1 if key in self.keys else 0
+
+
 @pytest.fixture
-def service():
+def service(monkeypatch):
     """Create a MemoryService with mocked internals for dedup testing."""
+    redis = _UpRedis()
+    monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda: redis)
     svc = MemoryService()
     svc._memory = MagicMock(name="Memory")
     svc._graphiti = MagicMock(name="Graphiti")
@@ -52,6 +80,16 @@ def service():
     svc._memory.vector_store.search.return_value = []
     # Default: vector_store.delete succeeds
     svc._memory.vector_store.delete.return_value = None
+    # Default: a re-read (taken once a pool lock is held) sees the rows the test's
+    # scroll serves, unchanged. _FakeQdrant installs its own, richer retrieve.
+    client = svc._memory.vector_store.client
+
+    def retrieve_scrolled_rows(collection_name=None, ids=None, **kwargs):
+        served = client.scroll.return_value
+        points = served[0] if isinstance(served, tuple) else []
+        return [p for p in points if p.id in set(ids or [])]
+
+    client.retrieve.side_effect = retrieve_scrolled_rows
     return svc
 
 
@@ -390,11 +428,19 @@ class TestDedupAllMemories:
 def _set_retrieve(service, payload_by_id: dict):
     """Make client.retrieve return real point mocks for known ids."""
 
+    client = service._memory.vector_store.client
+    served = client.scroll.return_value
+    scrolled = {p.id: p for p in (served[0] if isinstance(served, tuple) else [])}
+
     def _retrieve(collection_name=None, ids=None, **kwargs):
         out = []
         for mid in ids or []:
             if mid in payload_by_id:
-                out.append(_make_point(mid, payload_by_id[mid]))
+                # the override on top of what the scroll served (a re-read of the same row)
+                base = scrolled[mid].payload if mid in scrolled else {}
+                out.append(_make_point(mid, {**base, **payload_by_id[mid]}))
+            elif mid in scrolled:  # a re-read of a row the scroll served: unchanged
+                out.append(scrolled[mid])
         return out
 
     service._memory.vector_store.client.retrieve.side_effect = _retrieve
@@ -495,11 +541,13 @@ class TestExactDedupReinforcement:
                                "created_at": "2025-06-01T00:00:00", "metadata": {}}),
         ]
         service._memory.vector_store.client.scroll.return_value = (memories, None)
-        service._memory.vector_store.client.retrieve.side_effect = Exception("Qdrant down")
+        # the group's re-read works; the counter write on the survivor fails
+        service._memory.vector_store.client.set_payload.side_effect = Exception("Qdrant down")
 
         result = service.dedup_memories("u1", semantic=False)
 
         assert result["exact_duplicates_removed"] == 1  # delete still happened
+        service._memory.vector_store.client.set_payload.assert_called_once()
 
 
 class TestSemanticDedupReinforcement:
@@ -945,6 +993,109 @@ def tombstone_on(monkeypatch):
 def _merged(service) -> set[str]:
     """Rows phase 2 retired, whichever way (hard delete or tombstone)."""
     return set(_deleted(service)) | set(_tombstoned(service))
+
+
+class TestDreamingOnSemanticPhase:
+    """Dreaming on (the flags-on stack) must not switch off the REVERSIBLE semantic phase.
+
+    Acceptance ran ``dedup-tombstone`` on a stack that also has DREAMING_ENABLED, and the
+    compile's dedup passed ``semantic=False`` there, so nothing was ever tombstoned.
+    """
+
+    TEXT = "The nightly report job runs at 02:00 UTC on weekdays"
+
+    def _pair(self, service):
+        return _FakeQdrant(service, [
+            _row("old", self.TEXT, "2025-01-01T00:00:00", scope="global", visibility="private"),
+            _row("new", self.TEXT, "2025-06-01T00:00:00", scope="global", visibility="private"),
+        ])
+
+    def _compile(self, service, tmp_path):
+        import asyncio
+        from unittest.mock import AsyncMock, patch
+
+        pytest.importorskip("fcntl")
+        from extensions.conversation_compiler.compile import compile_date
+        from extensions.conversation_compiler.obsidian_writer import ObsidianWriter
+
+        with patch(
+            "extensions.conversation_compiler.compile._async_call_gemini",
+            new=AsyncMock(return_value="summary"),
+        ):
+            return asyncio.run(
+                compile_date("2026-11-16", service, ObsidianWriter(vault_path=tmp_path / "v"), user_id="u1")
+            )
+
+    def test_compile_dedup_tombstones_with_dreaming_on_when_the_flag_is_on(
+        self, service, tmp_path, monkeypatch, tombstone_on
+    ):
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        # dedup takes the pool's dream lock here: a stand-in for the Redis the stack runs
+        from tests.test_dedup_dream_exclusion import _FakeRedis
+
+        monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda r=_FakeRedis(): r)
+        fake = self._pair(service)
+
+        result = self._compile(service, tmp_path)
+
+        assert result.dedup_triggered is True
+        assert fake.payloads["old"]["metadata"]["dream_tombstoned"] is True
+        assert "old" in fake.payloads and _deleted(service) == []
+
+    def test_dreaming_on_without_the_flag_still_skips_the_lossy_phase(
+        self, service, tmp_path, monkeypatch
+    ):
+        from config import settings
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", True)
+        monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", False)
+        fake = self._pair(service)
+
+        self._compile(service, tmp_path)
+
+        assert _merged(service) == set()
+        assert "dream_tombstoned" not in fake.payloads["old"]["metadata"]
+
+    @pytest.mark.parametrize(
+        "dreaming, flag, expected",
+        [(False, False, True), (False, True, True), (True, False, False), (True, True, True)],
+    )
+    def test_cron_and_compile_share_one_rule(self, monkeypatch, dreaming, flag, expected):
+        from config import settings
+        from extensions.conversation_compiler.compile import _semantic_dedup_enabled
+        from extensions.dreaming.config import dreaming_settings
+        from memory.delete import semantic_dedup_phase_enabled
+
+        monkeypatch.setattr(dreaming_settings, "enabled", dreaming)
+        monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", flag)
+        assert semantic_dedup_phase_enabled() is expected
+        assert _semantic_dedup_enabled() is expected
+
+    @pytest.mark.parametrize(
+        "dreaming, flag, expected",
+        [(False, False, True), (False, True, True), (True, False, False), (True, True, True)],
+    )
+    def test_dedup_cron_passes_the_shared_rule(self, monkeypatch, dreaming, flag, expected):
+        """The cron's whole truth table: forcing ``semantic`` either way fails a cell."""
+        import asyncio
+        from unittest.mock import MagicMock
+
+        import worker
+        from config import settings
+        from extensions.dreaming.config import dreaming_settings
+
+        monkeypatch.setattr(dreaming_settings, "enabled", dreaming)
+        monkeypatch.setattr(settings, "dedup_semantic_tombstone_enabled", flag)
+        svc = MagicMock()
+        svc.get_all_user_ids.return_value = ["u1"]
+        svc.dedup_memories.return_value = {
+            "exact_duplicates_removed": 0, "semantic_duplicates_removed": 0, "graph_jobs": [],
+        }
+        asyncio.run(worker.dedup_all_memories({"service": svc}))
+        svc.dedup_memories.assert_called_once_with("u1", semantic=expected)
 
 
 @pytest.mark.usefixtures("tombstone_on")
