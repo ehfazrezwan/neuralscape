@@ -183,3 +183,32 @@ async def test_cron_past_a_finished_run_enqueues_again_and_counts_it(monkeypatch
         pool.finish(job_id)
         assert (await worker.connector_sync_cron(ctx))["enqueued"] == 1
     assert len(pool.enqueued) == 2
+
+
+@pytest.mark.asyncio
+async def test_resource_whose_chunks_failed_to_store_is_not_marked_synced(harness, monkeypatch):
+    worker, vault, _state, ingested, ctx = harness
+    gen = await _register(vault)
+    failing = {"b"}
+
+    def flaky_ingest(service, doc):
+        rid = doc.source["external_id"]
+        ingested.append(rid)
+        if rid in failing:
+            return {"graph_jobs": [], "stores_failed": 2, "store_errors": ["RuntimeError: store down"]}
+        return {"graph_jobs": [], "stores_failed": 0, "store_errors": []}
+
+    monkeypatch.setattr("ingest.pipeline.ingest_document", flaky_ingest)
+
+    first = await worker.process_connector_sync(ctx, "rest-1", gen)
+    assert (first["synced"], first["skipped"], first["failed"]) == (1, 0, 1)
+    # Only the resource that stored fully is remembered; the failed one stays eligible.
+    assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1"}
+    assert (await vault.get("rest-1"))["cursor"] is None
+
+    ingested.clear()
+    failing.clear()
+    second = await worker.process_connector_sync(ctx, "rest-1", gen)
+    assert (second["synced"], second["skipped"], second["failed"]) == (1, 1, 0)
+    assert ingested == ["b"]
+    assert (await vault.get("rest-1"))["last_revision_by_id"] == {"a": "1", "b": "1"}

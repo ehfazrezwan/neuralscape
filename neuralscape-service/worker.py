@@ -1789,7 +1789,7 @@ async def process_connector_sync(
     revisions = dict(record.get("last_revision_by_id") or {})
     cursor = record.get("cursor")
     next_cursor = cursor
-    synced = skipped = 0
+    synced = skipped = failed = 0
 
     try:
         resources, next_cursor = await adapter.list_resources(cursor)
@@ -1820,11 +1820,24 @@ async def process_connector_sync(
             await _enqueue_graph_jobs(
                 ctx, _ing.pop("graph_jobs", []), adapter=_ing.get("adapter")
             )
+            if _ing.get("stores_failed"):
+                # Some chunks did not store: leave the saved revision alone so the next
+                # sync picks this resource up again instead of skipping it as unchanged.
+                logger.warning(
+                    f"Connector {connector_id}: {_ing.get('stores_failed')} chunk store(s) failed for "
+                    f"{r.external_id}; not marking it synced"
+                )
+                failed += 1
+                continue
             if r.revision:
                 revisions[r.external_id] = r.revision
             synced += 1
     finally:
         await adapter.aclose()
+
+    if failed:
+        # Keep the cursor where this run started so a failed resource is listed again.
+        next_cursor = cursor
 
     # Atomic, field-scoped and bound to the instance read above: a connector
     # deleted, re-created or re-owned meanwhile keeps its own state.
@@ -1844,8 +1857,8 @@ async def process_connector_sync(
             f"Connector sync [{connector_id}]: connector replaced or removed, or newer progress saved "
             "by an overlapping sync; state not saved"
         )
-    logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged")
-    return {"connector_id": connector_id, "synced": synced, "skipped": skipped}
+    logger.info(f"Connector sync [{connector_id}]: {synced} ingested, {skipped} unchanged, {failed} failed")
+    return {"connector_id": connector_id, "synced": synced, "skipped": skipped, "failed": failed}
 
 
 async def connector_sync_cron(ctx: dict) -> dict:
