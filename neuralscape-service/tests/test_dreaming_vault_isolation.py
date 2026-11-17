@@ -6,10 +6,14 @@ owner-accepted). The OKF index files and Home must never repeat that content.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from extensions.dreaming import reflect
 from okf.vault import refresh_bundle_indexes
 
 POOL = "user--someone-else"
+# The diary page name comes from the product (slug + hash of the exact pool id), never hard-coded.
+DIARY = f"Dreams/{reflect.diary_page_path(Path('Dreams'), POOL).name}"
 
 
 def test_only_the_dream_diary_carries_another_users_private_text(tmp_path):
@@ -28,7 +32,7 @@ def test_only_the_dream_diary_carries_another_users_private_text(tmp_path):
         str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")
         if p.is_file() and ("Rust" in p.read_text() or "zqTOKEN" in p.read_text())
     )
-    assert carriers == ["Dreams/user-someone-else.md"], carriers
+    assert carriers == [DIARY], carriers
 
 
 def test_dreams_index_is_not_a_diary_page_and_stays_clean(tmp_path):
@@ -58,9 +62,9 @@ def test_real_layout_pool_id_is_only_in_diary_log_and_dreams_index(tmp_path):
     _sweep_writes(tmp_path)
     uid = POOL.split("--", 1)[1]
     id_files = sorted({h.split(":", 1)[0] for h in marker_hits(tmp_path, [uid])})
-    assert id_files == ["Dreams/index.md", "Dreams/user-someone-else.md", "log.md"], id_files
+    assert id_files == ["Dreams/index.md", DIARY, "log.md"], id_files
     text_files = sorted({h.split(":", 1)[0] for h in marker_hits(tmp_path, ["zqTOKEN", "Rust"])})
-    assert text_files == ["Dreams/user-someone-else.md"], text_files
+    assert text_files == [DIARY], text_files
 
 
 def test_marker_hits_names_file_and_line_and_honours_skip(tmp_path):
@@ -68,5 +72,5 @@ def test_marker_hits_names_file_and_line_and_honours_skip(tmp_path):
 
     _sweep_writes(tmp_path)
     hits = marker_hits(tmp_path, ["zqTOKEN"])
-    assert len(hits) == 1 and hits[0].startswith("Dreams/user-someone-else.md:") and "zqTOKEN" in hits[0]
+    assert len(hits) == 1 and hits[0].startswith(DIARY + ":") and "zqTOKEN" in hits[0]
     assert marker_hits(tmp_path, ["zqTOKEN"], skip=lambda rel: rel.startswith("Dreams/")) == []
