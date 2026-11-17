@@ -902,6 +902,25 @@ class TestHealthEndpointChecks:
         assert resp.status_code == 200
         assert resp.json()["checks"]["graph_store"] == "unreachable"
 
+    def test_health_cold_graph_is_reported_as_before_and_never_probed_or_built(self, client, monkeypatch):
+        """Graph not initialised yet (lazy init pending): ``not_initialized``, no probe, no init in the bound."""
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        svc = MagicMock()
+        svc._graphiti = None
+        probe = AsyncMock()
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", svc)
+        monkeypatch.setattr(main, "_probe_graph_store", probe)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        assert resp.json()["checks"]["graph_store"] == "not_initialized"
+        probe.assert_not_called()
+        svc._get_memory.assert_not_called()
+        svc._get_graphiti.assert_not_called()
+        svc._run_on_bridge.assert_not_called()
+
     def test_health_graph_store_ok_when_the_probe_answers(self, client, monkeypatch):
         class UpDriver:
             async def health_check(self):
