@@ -350,6 +350,10 @@ class GraphAdminMixin:
                 return checked
             ep_group = checked["group_id"]
 
+            # Deleting an episode (node, edges, entities) needs the same permission as editing
+            # a memory in that group; nothing is touched before this passes.
+            self._check_episode_delete_permission(episode_uuid, ep_group, user_id)
+
             # Authorized: run the same cascade a memory delete runs (provenance.py) so the
             # edges only this episode supports are removed (edges another episode still
             # supports stay live), its entities are cleaned and the episode node is deleted.
@@ -362,6 +366,8 @@ class GraphAdminMixin:
                     if k in cascade
                 }
             else:
+                # The cascade did not resolve the episode: only the node is removed here.
+                result["graph_cascade"] = {"resolved": False, "edges_left": True}
                 # Nothing resolved (or the cascade could not run): remove the node itself,
                 # as this endpoint always has.
                 async def _plain_delete():
@@ -379,8 +385,8 @@ class GraphAdminMixin:
             repair = self._repair_episode_siblings(
                 user_id, {episode_uuid}, set(), deleted_ids=set(), skip_job_ids=set()
             )
-            if repair.get("unrepaired_ids") or repair.get("lookup_failed"):
-                result["episode_refs_unrepaired"] = list(repair.get("unrepaired_ids") or [])
+            if repair.get("clear_failed_ids") or repair.get("lookup_failed"):
+                result["episode_refs_unrepaired"] = list(repair.get("clear_failed_ids") or [])
                 logger.warning(
                     "Episode %s deleted but memory row references not all cleared: %s",
                     episode_uuid, repair,
@@ -391,6 +397,35 @@ class GraphAdminMixin:
         except Exception as e:
             logger.error(f"Failed to delete episode {episode_uuid}: {e}")
             return {"error": str(e)}
+
+    def _check_episode_delete_permission(self, episode_uuid: str, ep_group: str, user_id: str) -> None:
+        """Require the permission of editing a memory in the episode's group; raises PermissionError.
+
+        Applies the memory edit rule (``memory.groups._check_edit_permission``): ``standard`` is
+        dictator-only, a private group is its owner's, and a ``shared`` episode may be removed by
+        the owner of every memory row that references it. If those rows cannot be found or
+        read, the delete is refused.
+        """
+        from memory.groups import _check_edit_permission
+
+        def _gate(meta: dict, payload_user: str) -> None:
+            _check_edit_permission(
+                meta, payload_user, user_id, edits_content=True, edits_visibility=False
+            )
+
+        if ep_group.startswith("standard"):
+            return _gate({"visibility": "standard"}, "")
+        if not ep_group.startswith("shared"):
+            return _gate({"visibility": "private", "owner_user_id": user_id}, user_id)
+        if settings.is_dictator(user_id):
+            return
+        rows = self._episode_survivors(episode_uuid, None, ())
+        if not rows:
+            raise PermissionError(
+                f"Episode {episode_uuid} is in a shared group and its owner cannot be established."
+            )
+        for _, payload in rows:
+            _gate(self._row_meta({"metadata": payload.get("metadata")}), payload.get("user_id", ""))
 
     def _find_junk_episodes(self, episodes: list[dict]) -> list[dict]:
         """Filter a list of episodes to only those matching junk patterns."""

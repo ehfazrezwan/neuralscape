@@ -464,10 +464,12 @@ class TestDeleteEpisode:
         assert out["message"] == "Episode e1 deleted"
         assert any("DETACH DELETE" in c for c, _ in log)
 
-    def test_shared_group_is_authorised(self, service):
-        _driver_with(service, [{"group_id": "shared"}])
+    def test_shared_group_episode_with_unestablished_owner_is_refused(self, service):
+        log = _driver_with(service, [{"group_id": "shared"}])
         _real_bridge(service)
-        assert service.delete_episode("e1", user_id="alice")["message"] == "Episode e1 deleted"
+        with pytest.raises(PermissionError, match="owner cannot be established"):
+            service.delete_episode("e1", user_id="alice")
+        assert not any("DETACH DELETE" in c for c, _ in log)
 
     def test_project_group_requires_project_id(self, service):
         _driver_with(service, [{"group_id": "user--alice--project--p"}])

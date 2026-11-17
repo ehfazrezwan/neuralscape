@@ -114,3 +114,61 @@ def test_admin_delete_of_a_foreign_episode_changes_nothing(world):
     assert conv.uuid in w.g.episodes
     assert w.q.meta(conv.ids[0])["graph_episode_uuid"] == conv.uuid
     assert w.removals == []
+
+
+def _seed_shared(w, owner=OWNER, uuid="ep-sh"):
+    """A shared-group episode with edges, referenced by one row owned by ``owner``."""
+    w.g.add_episode(uuid, "mem0_episode_sh", "shared", "shared fact", edge_uuids=["e-sh"], entities=["ent-sh"])
+    w.g.add_edge("e-sh", "shared", [uuid])
+    w.q.add("00000000-0000-4000-8000-0000000000aa", "shared fact", user_id=owner,
+            visibility="shared", graph_episode_uuid=uuid)
+    return uuid
+
+
+def test_reader_of_a_shared_group_cannot_delete_the_owners_episode(world):
+    w = world
+    uuid = _seed_shared(w, owner=OWNER)
+    with pytest.raises(PermissionError):
+        w.svc.delete_episode(uuid, user_id=OTHER)
+    assert uuid in w.g.episodes
+    assert w.g.live_edges("shared") == ["e-sh"]
+    assert w.removals == []
+    assert w.q.meta("00000000-0000-4000-8000-0000000000aa")["graph_episode_uuid"] == uuid
+
+
+def test_owner_may_delete_a_shared_episode_with_the_cascade(world):
+    w = world
+    uuid = _seed_shared(w, owner=OWNER)
+    out = w.svc.delete_episode(uuid, user_id=OWNER)
+    assert out["message"] == f"Episode {uuid} deleted"
+    assert uuid not in w.g.episodes
+    assert w.removals == [("shared", [uuid])]
+    assert w.g.live_edges("shared") == []
+    assert w.q.meta("00000000-0000-4000-8000-0000000000aa")["graph_episode_uuid"] is None
+
+
+def test_standard_episode_is_refused_for_a_non_dictator(world, monkeypatch):
+    w = world
+    w.g.add_episode("ep-std", "n", "standard", "rule", edge_uuids=[])
+    monkeypatch.setattr("config.settings.standards_enabled", True)
+    with pytest.raises(PermissionError, match="dictator"):
+        w.svc.delete_episode("ep-std", user_id=OWNER)
+    assert "ep-std" in w.g.episodes
+
+
+def test_refs_unrepaired_lists_only_rows_whose_reference_stayed(world):
+    w = world
+    conv = seed_conversation(w, n=2)
+    w.q.meta(conv.ids[1])["workspace"] = "other"  # ref is cleared but no re-enrichment job can be built
+    out = w.svc.delete_episode(conv.uuid, user_id=OWNER)
+    assert "episode_refs_unrepaired" not in out
+    assert w.q.meta(conv.ids[1])["graph_episode_uuid"] is None
+
+
+def test_unresolved_cascade_says_edges_were_left(world):
+    w = world
+    conv = seed_conversation(w, n=2)
+    w.svc._cascade_expire_episode = lambda *a, **k: {"resolved": False}
+    out = w.svc.delete_episode(conv.uuid, user_id=OWNER)
+    assert out["graph_cascade"] == {"resolved": False, "edges_left": True}
+    assert conv.uuid not in w.g.episodes
