@@ -839,6 +839,78 @@ class TestHealthEndpointChecks:
         assert client.get("/health").json()["checks"]["vector_store"] == "ok"
         mock_svc._memory.vector_store.client.get_collections.assert_called_once()
 
+    # -- graph_store: a real, bounded Neo4j probe through the Graphiti bridge ------------------
+
+    @staticmethod
+    def _graph_service(driver):
+        """A service whose graph driver lives on a real bridge loop (as in prod)."""
+        import asyncio
+        import types
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        fake = types.SimpleNamespace(_bridge=types.SimpleNamespace(_loop=loop))
+        svc = MagicMock()
+        svc._graphiti = types.SimpleNamespace(driver=driver)
+        svc._run_on_bridge = lambda coro, timeout=30.0: MemoryService._run_on_bridge(fake, coro, timeout)
+        return svc, loop, thread
+
+    @staticmethod
+    def _stop_loop(loop, thread):
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(5)
+        loop.close()
+
+    def _health_with_graph_driver(self, client, monkeypatch, driver):
+        mock_tm = MagicMock(name="TaskManager")
+        mock_tm.pool = MagicMock()
+        mock_tm.pool.ping = AsyncMock(return_value=True)
+        svc, loop, thread = self._graph_service(driver)
+        monkeypatch.setattr(main, "_task_manager", mock_tm)
+        monkeypatch.setattr(main, "_service", svc)
+        monkeypatch.setattr(main, "_GRAPH_STORE_PROBE_TIMEOUT_S", 0.3, raising=False)
+        try:
+            return client.get("/health")
+        finally:
+            self._stop_loop(loop, thread)
+
+    def test_health_reports_graph_store_unreachable_when_neo4j_is_down(self, client, monkeypatch):
+        class DownDriver:
+            async def health_check(self):
+                raise ConnectionError("neo4j refused")
+
+        resp = self._health_with_graph_driver(client, monkeypatch, DownDriver())
+        # Same rule as any non-vector component: degraded, still 200 (a graph blip must not
+        # restart the API); only the vector store turns the endpoint into a 503.
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["checks"]["graph_store"] == "unreachable"
+        assert body["status"] == "degraded"
+
+    def test_health_graph_store_probe_is_bounded_when_neo4j_hangs(self, client, monkeypatch):
+        import asyncio
+        import time
+
+        class HungDriver:
+            async def health_check(self):
+                await asyncio.sleep(30)
+
+        started = time.monotonic()
+        resp = self._health_with_graph_driver(client, monkeypatch, HungDriver())
+        assert time.monotonic() - started < 5
+        assert resp.status_code == 200
+        assert resp.json()["checks"]["graph_store"] == "unreachable"
+
+    def test_health_graph_store_ok_when_the_probe_answers(self, client, monkeypatch):
+        class UpDriver:
+            async def health_check(self):
+                return None
+
+        resp = self._health_with_graph_driver(client, monkeypatch, UpDriver())
+        assert resp.status_code == 200
+        assert resp.json()["checks"]["graph_store"] == "ok"
+
 
 # ══════════════════════════════════════════════
 # Liveness endpoint: /health/live must never touch backends
