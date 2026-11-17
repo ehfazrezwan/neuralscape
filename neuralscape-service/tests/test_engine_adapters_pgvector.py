@@ -120,7 +120,8 @@ def test_embedding_dimension_mismatch_is_rejected_without_writing():
     with pytest.raises(PortFailure) as raised:
         a.apply(ctx(), EngineRecord(record_id="r", revision=1, tenant_id="tenant-a", text="t"))
     assert raised.value.code is InternalErrorCode.INVALID_SCHEMA
-    assert conn.statements == []
+    # The vector is checked once the stored row is known (a relabel never embeds): nothing is written.
+    assert not [sql for sql, _ in conn.statements if sql.startswith(("INSERT", "UPDATE"))]
 
 
 def test_apply_takes_the_advisory_lock_before_reading_or_writing():
@@ -240,3 +241,40 @@ def test_module_does_not_import_service_runtime_or_a_pgvector_helper():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert not imported & {"memory", "memory_service", "worker", "main", "config", "pgvector", "qdrant_client"}
+
+
+def test_a_relabel_and_a_replay_make_no_embedding_call_and_a_failing_provider_does_not_stop_them():
+    """Before: the text was embedded before the stored row was read, so a label-only relabel (and a replay)
+    paid a provider call per record and failed whenever the provider was down."""
+    row = [(5, False, "same", ["a"])]
+    a, conn = adapter(FakeConn({"FROM ns_engine.records": row}))
+    calls = []
+
+    def embed(text):
+        calls.append(text)
+        raise RuntimeError("provider down")
+
+    a._embed = embed
+    a.apply(ctx(), EngineRecord(record_id="r", revision=5, tenant_id="tenant-a", text="same", labels=("b",)))  # relabel
+    a.apply(ctx(), EngineRecord(record_id="r", revision=5, tenant_id="tenant-a", text="same", labels=("a",)))  # replay
+    assert calls == []
+    updates = [sql for sql, _ in conn.statements if sql.startswith("UPDATE")]
+    assert len(updates) == 1 and "SET labels" in updates[0]
+
+
+def test_a_new_revision_still_embeds_once_and_a_provider_failure_writes_nothing():
+    a, conn = adapter(FakeConn({"FROM ns_engine.records": [(5, False, "old", ["a"])]}))
+    calls = []
+    a._embed = lambda t: calls.append(t) or [0.1, 0.2, 0.3]
+    a.apply(ctx(), EngineRecord(record_id="r", revision=6, tenant_id="tenant-a", text="new", labels=("a",)))
+    assert calls == ["new"]
+
+    def down(text):
+        raise RuntimeError("provider down")
+
+    a2, conn2 = adapter()
+    a2._embed = down
+    with pytest.raises(PortFailure) as raised:
+        a2.apply(ctx(), EngineRecord(record_id="r", revision=1, tenant_id="tenant-a", text="t"))
+    assert raised.value.code is InternalErrorCode.UNAVAILABLE_DEPENDENCY
+    assert not [sql for sql, _ in conn2.statements if sql.startswith(("INSERT", "UPDATE"))]

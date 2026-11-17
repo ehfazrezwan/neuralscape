@@ -45,6 +45,7 @@ from datetime import datetime, timezone
 
 from config import settings
 from schemas import MemoryVisibility
+from memory.delete import _is_tombstoned  # the one tombstone check (either metadata depth)
 from memory.groups import _build_group_id, decode_group_id
 
 logger = logging.getLogger(__name__)
@@ -64,6 +65,7 @@ SWEEP_CAPPED_BACKOFF_S = 3600.0
 SWEEP_CAPPED_BACKOFF_MAX_S = 86400.0
 SWEEP_CAPPED_PER_RUN = 1
 _METADATA_PARENTS = ("metadata", "metadata.metadata")  # a row may carry its metadata wrapped one level deeper
+_DELETED_CLEANUP_BACKOFF_S = (0.5, 1.5)  # waits between the removal attempts for a deleted memory's episode
 _REENRICH_ATTEMPTS = 3  # re-enrichments of one row that a concurrent edit may invalidate in a row
 # The ledger job that re-enriches one memory into a fresh episode (see legacy_jobs).
 GRAPH_REENRICH_OPERATION = "graph.reenrich"
@@ -372,14 +374,8 @@ class ProvenanceMixin:
             content=mem.get("memory", ""),
             exclude_ids=exclude_ids,
         )
-        superseded = metadata.get(SUPERSEDED_EPISODES_KEY)
-        if ((memory_id or whole_user) and isinstance(superseded, list) and superseded
-                and getattr(settings, "graph_support_aware_removal_enabled", False)):
-            left = self._retire_episodes(
-                exclude_ids,
-                [u for u in superseded if isinstance(u, str)],
-                owner_user_id=metadata.get("owner_user_id") or mem.get("user_id") or None,
-            )
+        if memory_id or whole_user:
+            left = self._retire_row_superseded(mem, metadata, exclude_ids)
             if left:
                 logger.warning(
                     "Superseded graph episodes of memory=%s could not be removed: %s", memory_id, left,
@@ -405,6 +401,20 @@ class ProvenanceMixin:
                     memory_id or "?", e,
                 )
         return result
+
+    def _retire_row_superseded(self, mem: dict, metadata: dict, exclude_ids) -> list[str]:
+        """Retire the episodes an earlier correction of this row could not remove (support-aware mode only);
+        returns the ones still in the graph."""
+
+        superseded = metadata.get(SUPERSEDED_EPISODES_KEY)
+        if not (isinstance(superseded, list) and superseded
+                and getattr(settings, "graph_support_aware_removal_enabled", False)):
+            return []
+        return self._retire_episodes(
+            exclude_ids,
+            [u for u in superseded if isinstance(u, str)],
+            owner_user_id=metadata.get("owner_user_id") or mem.get("user_id") or None,
+        )
 
     def _support_aware_episode_removal(self, group_id: str, episode_uuids: list[str]) -> dict | None:
         """Remove episodes support-aware through the current-stack graph adapter; ``None`` on failure."""
@@ -525,7 +535,7 @@ class ProvenanceMixin:
             wrapped = isinstance(outer.get("metadata"), dict)
             meta = outer["metadata"] if wrapped else outer
             parent = "metadata.metadata" if wrapped else "metadata"
-            if meta.get("dream_tombstoned"):
+            if _is_tombstoned(payload):
                 continue
             job = {
                 "memory_id": memory_id,
@@ -751,7 +761,7 @@ class ProvenanceMixin:
             meta = row.get("metadata") or {}
             if isinstance(meta.get("metadata"), dict):
                 meta = meta["metadata"]
-            if meta.get("dream_tombstoned"):
+            if _is_tombstoned(row):
                 return {"skipped": True, "reason": "memory_tombstoned"}
             owner = meta.get("owner_user_id") or row.get("user_id", "")
             visibility = meta.get("visibility") or MemoryVisibility.PRIVATE.value
@@ -779,9 +789,11 @@ class ProvenanceMixin:
                 # The survivor was deleted while its job extracted: the delete found no episode yet (the row
                 # carried none, the old one was removed), so the episode just written would keep the deleted
                 # text in the graph.  Remove it by uuid, as the graph enrichment job does for a deleted memory.
-                self._remove_written_episode(
-                    memory_id, group_id, written, row.get("memory", ""), "deleted memory")
-                return {"skipped": True, "reason": "memory_deleted_during_enrichment"}
+                result = {"skipped": True, "reason": "memory_deleted_during_enrichment"}
+                stranded = self._remove_episode_of_deleted_memory(memory_id, group_id, written, row.get("memory", ""))
+                if stranded:
+                    result["unresolved_episodes"] = [stranded]
+                return result
             if outcome.get("cleaned_up"):
                 return {"memory_ids": [memory_id]}
             current = self._current_enrichment_snapshot(memory_id)
@@ -852,6 +864,34 @@ class ProvenanceMixin:
                 f"graph cleanup unresolved for {what} {memory_id}: group_id={group_id!r} "
                 f"episode_uuid={episode_uuid!r}; re-run the episode cascade for this group/episode"
             )
+
+    def _remove_episode_of_deleted_memory(
+        self, memory_id: str, group_id: str, written: dict, content: str
+    ) -> dict | None:
+        """Remove the episode written for a memory that was deleted meanwhile, retrying a few times with a
+        short backoff.  A retried job cannot do it later (it finds no row, so it never learns the episode),
+        so a removal that still fails is reported here: logged at ERROR and returned (uuid, group) for the
+        job result.  Returns ``None`` when the episode is gone."""
+
+        last: Exception | None = None
+        for delay in (0.0, *_DELETED_CLEANUP_BACKOFF_S):
+            if delay:
+                time.sleep(delay)
+            try:
+                self._remove_written_episode(memory_id, group_id, written, content, "deleted memory")
+                return None
+            except Exception as exc:  # noqa: BLE001 - unresolved removal or a graph error: try again, then report
+                last = exc
+        stranded = {"episode_uuid": written.get("episode_uuid"), "group_id": group_id}
+        if not stranded["episode_uuid"]:
+            stranded["episode_name"] = written.get("episode_name")
+        logger.error(
+            "Episode written for deleted memory=%s could not be removed after %d attempts "
+            "(episode_uuid=%r episode_name=%r group_id=%r); it still holds the deleted text: %s",
+            memory_id, len(_DELETED_CLEANUP_BACKOFF_S) + 1, written.get("episode_uuid"),
+            written.get("episode_name"), group_id, last,
+        )
+        return stranded
 
     def _mark_reenrich_pending(self, memory_id: str, episode: str) -> None:
         """Put the row back to "awaiting re-enrichment" after an episode it pointed at was removed."""
@@ -1083,7 +1123,17 @@ class ProvenanceMixin:
                     hit = covered[(group, ref)]
                     break
             if hit is not None:
-                results[mid] = dict(hit, memory_id=mid or None)
+                # The current episode is already gone (one cascade for all rows that share it), but the
+                # episodes THIS row's earlier corrections left behind are its own: retire them here.
+                shared = {k: v for k, v in hit.items() if k != "superseded_unresolved"}
+                shared["memory_id"] = mid or None
+                if mid:
+                    left = self._retire_row_superseded(
+                        mem, meta, tuple(dict.fromkeys(i for i in (mid, *sorted(deleted)) if i)))
+                    if left:
+                        shared["superseded_unresolved"] = list(left)
+                        unresolved.append(mid)
+                results[mid] = shared
                 continue
 
             try:
@@ -1246,7 +1296,7 @@ class ProvenanceMixin:
             siblings = [t for t in siblings if t[0] not in failed]
 
         for sid, payload, meta, _ in siblings:
-            if sid in skip_job_ids or meta.get("dream_tombstoned"):
+            if sid in skip_job_ids or _is_tombstoned(payload):
                 continue  # tombstoned rows are not live: ref cleared, no re-ingest
             content = payload.get("data") or ""
             workspace = meta.get("workspace")

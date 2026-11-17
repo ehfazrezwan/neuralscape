@@ -425,13 +425,39 @@ def test_a_survivor_deleted_while_its_re_enrichment_runs_has_the_new_episode_rem
     assert removed == [("user--u", {"episode_uuid": "ep-new"})]
 
 
-def test_an_unresolved_cleanup_of_a_survivor_deleted_meanwhile_fails_the_job_visibly(service, monkeypatch):
+def test_an_unresolved_cleanup_of_a_survivor_deleted_meanwhile_is_retried_then_reported_with_the_episode(
+        service, monkeypatch, caplog):
+    """The row is gone, so a retried job would only answer ``memory_missing`` and never see the episode again:
+    the removal is retried inside the attempt, and when it still fails the episode and its group are logged
+    at ERROR and returned in the job result (the failure is visible, not a silent skip)."""
+    import memory.provenance as provenance
+
+    monkeypatch.setattr(provenance, "_DELETED_CLEANUP_BACKOFF_S", (0.0, 0.0))
     reads = iter([_survivor_row(), None])
     service._memory.get.side_effect = lambda memory_id: next(reads)
     monkeypatch.setattr(service, "enrich_graph", lambda **kw: kw["result_out"].update(episode_uuid="ep-new") or True)
-    monkeypatch.setattr(service, "_cascade_expire_episode", lambda group, **kw: {"resolved": False})
-    with pytest.raises(RuntimeError, match="graph cleanup unresolved for deleted memory m2"):
-        service.reenrich_memory_graph("m2")
+    attempts = []
+    monkeypatch.setattr(service, "_cascade_expire_episode",
+                        lambda group, **kw: attempts.append(group) or {"resolved": False})
+    with caplog.at_level("ERROR"):
+        result = service.reenrich_memory_graph("m2")
+    assert len(attempts) == 3 and set(attempts) == {"user--u"}  # bounded retries inside the attempt
+    assert result == {"skipped": True, "reason": "memory_deleted_during_enrichment",
+                      "unresolved_episodes": [{"episode_uuid": "ep-new", "group_id": "user--u"}]}
+    assert any("ep-new" in r.getMessage() and "user--u" in r.getMessage() and r.levelname == "ERROR"
+               for r in caplog.records)
+
+
+def test_a_removal_that_succeeds_on_a_retry_leaves_nothing_to_report(service, monkeypatch):
+    import memory.provenance as provenance
+
+    monkeypatch.setattr(provenance, "_DELETED_CLEANUP_BACKOFF_S", (0.0, 0.0))
+    reads = iter([_survivor_row(), None])
+    service._memory.get.side_effect = lambda memory_id: next(reads)
+    monkeypatch.setattr(service, "enrich_graph", lambda **kw: kw["result_out"].update(episode_uuid="ep-new") or True)
+    answers = iter([{"resolved": False}, {"resolved": True}])
+    monkeypatch.setattr(service, "_cascade_expire_episode", lambda group, **kw: next(answers))
+    assert service.reenrich_memory_graph("m2") == {"skipped": True, "reason": "memory_deleted_during_enrichment"}
 
 
 def test_a_survivor_still_present_after_its_re_enrichment_is_left_alone(service, monkeypatch):
@@ -962,3 +988,156 @@ def test_a_wrapped_survivor_with_a_name_only_outer_reference_is_re_enriched_and_
         "graph_episode_name": "name-1", "metadata": {"owner_user_id": "u"}}})
     assert svc2._reenrich_survivors([stale], "ep-1") == 0
     assert get2(WRAPPED_ID)["metadata"]["graph_episode_uuid"] == "ep-9" and svc2.jobs == []
+
+
+# ── review round 8: an outer-only tombstone on a wrapped row hides it from every re-enrichment path ──
+
+
+def _outer_tombstoned_wrapped_row():
+    return {"memory": "deleted text", "user_id": "u", "metadata": {
+        "dream_tombstoned": True,
+        "metadata": {"owner_user_id": "u", "visibility": "private", "graph_reenrich_pending": "ep-1"}}}
+
+
+def test_the_re_enrichment_job_skips_a_wrapped_row_tombstoned_at_the_outer_depth(service, monkeypatch):
+    service._memory.get.return_value = _outer_tombstoned_wrapped_row()
+    monkeypatch.setattr(service, "enrich_graph", lambda **kw: pytest.fail("a deleted row's text must not reach the graph"))
+    assert service.reenrich_memory_graph("m2") == {"skipped": True, "reason": "memory_tombstoned"}
+
+
+def test_survivors_skip_a_wrapped_row_tombstoned_at_the_outer_depth(service):
+    jobs = []
+    service.set_graph_reenrich_dispatch(jobs.append)
+    row = _outer_tombstoned_wrapped_row()
+    assert service._reenrich_survivors([("m2", {"data": row["memory"], "metadata": row["metadata"]})], "ep-1") == 0
+    assert jobs == []
+    service._memory.vector_store.client.set_payload.assert_not_called()
+
+
+def test_the_sweep_never_writes_an_outer_tombstoned_wrapped_rows_text_to_the_graph(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    point = SimpleNamespaceFor(id="m2", payload={"data": "deleted text", "metadata": _outer_tombstoned_wrapped_row()["metadata"]})
+    service._memory.vector_store.client.scroll.side_effect = [([point], None), ([], None)]
+    service._memory.get.return_value = _outer_tombstoned_wrapped_row()
+    monkeypatch.setattr(service, "enrich_graph", lambda **kw: pytest.fail("a deleted row's text must not reach the graph"))
+    cleared = []
+    monkeypatch.setattr(service, "_clear_reenrich_pending", cleared.append)
+    out = service.sweep_pending_reenrichments(min_age_s=0)
+    assert out["reenriched"] == 0 and cleared == ["m2"]
+
+
+# ── review round 8: a row that recorded its episode by name only ──
+
+
+def _name_only_row(**extra):
+    return {"memory": "old text", "user_id": "u", "metadata": {
+        "owner_user_id": "u", "visibility": "private", "graph_episode_name": "old-name", **extra}}
+
+
+def test_a_name_only_reference_is_resolved_to_the_episode_before_it_is_replaced(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    service._memory.get.return_value = _name_only_row()
+    seen = []
+    monkeypatch.setattr(service, "_lookup_episode",
+                        lambda group, field, value, **kw: seen.append((group, field, value, kw)) or {"uuid": "ep-old", "name": value})
+    assert service._previous_graph_episodes("m1") == (["ep-old"], False)
+    assert seen == [("user--u", "name", "old-name", {"fail_closed": True})]
+
+
+def test_a_correction_retires_the_episode_a_name_only_row_pointed_at(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    service._memory.get.return_value = _name_only_row()
+    monkeypatch.setattr(service, "_lookup_episode", lambda group, field, value, **kw: {"uuid": "ep-old", "name": value})
+    service._memory.graph.add.return_value = {"episode_uuid": "ep-new", "episode_name": "new-name"}
+    monkeypatch.setattr(service, "_attach_memory_id_to_graph_nodes", lambda **kw: None)
+    monkeypatch.setattr(service, "_persist_graph_episode_ref", lambda *a: None)
+    monkeypatch.setattr(service, "_maybe_supersede_contradicted", lambda **kw: None)
+    retired = []
+    monkeypatch.setattr(service, "_retire_episodes", lambda ids, uuids, owner_user_id=None: retired.append(uuids) or [])
+    assert service.enrich_graph(content="new text", user_id="u", project_id=None, visibility="private", memory_id="m1")
+    assert retired == [["ep-old"]]
+
+
+def test_an_unresolvable_name_only_reference_defers_the_enrichment_and_keeps_the_reference(service, monkeypatch):
+    from memory.provenance import GraphReadError
+
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    service._memory.get.return_value = _name_only_row()
+
+    def _down(*a, **kw):
+        raise GraphReadError("neo4j down")
+
+    monkeypatch.setattr(service, "_lookup_episode", _down)
+    persisted = []
+    monkeypatch.setattr(service, "_persist_graph_episode_ref", lambda *a: persisted.append(a))
+    assert service._previous_graph_episodes("m1") is None
+    assert service.enrich_graph(content="new text", user_id="u", project_id=None,
+                                visibility="private", memory_id="m1") is False
+    assert persisted == []
+    service._memory.graph.add.assert_not_called()
+
+
+def test_a_name_that_no_episode_carries_any_more_has_nothing_to_retire(service, monkeypatch):
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    service._memory.get.return_value = _name_only_row()
+    monkeypatch.setattr(service, "_lookup_episode", lambda *a, **kw: None)
+    assert service._previous_graph_episodes("m1") == ([], False)
+
+
+# ── review round 8: rows sharing one current episode keep their own superseded episodes ──
+
+
+def test_two_rows_sharing_the_current_episode_each_retire_their_own_superseded_episodes(service, monkeypatch):
+    """Before: the second row reused the first row's cascade result and its superseded episode was never retired."""
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    cascades = []
+    monkeypatch.setattr(service, "_cascade_expire_episode",
+                        lambda *a, **kw: cascades.append(kw) or {"resolved": True, "episode_uuid": "ep-E", "episode_name": "n"})
+    retired = []
+
+    def _retire(exclude, uuids, owner_user_id=None):
+        retired.append((exclude, list(uuids)))
+        return ["ep-B"] if uuids == ["ep-B"] else []
+
+    monkeypatch.setattr(service, "_retire_episodes", _retire)
+    monkeypatch.setattr(service, "_repair_episode_siblings",
+                        lambda *a, **kw: {"graph_jobs": [], "unrepaired_ids": []})
+
+    def _mem(superseded):
+        return {"memory": "x", "metadata": {"owner_user_id": "u", "graph_episode_uuid": "ep-E",
+                                            "graph_episode_superseded": superseded}}
+
+    batch = service._cascade_rows_once(
+        [{"id": "m1", "mem": _mem(["ep-A"])}, {"id": "m2", "mem": _mem(["ep-B"])}], deleted_ids=("m1", "m2"))
+    assert len(cascades) == 1  # the shared current episode is still removed once
+    assert [uuids for _, uuids in retired] == [["ep-A"], ["ep-B"]]  # each row's own list is retired
+    assert batch["unresolved_ids"] == ["m2"]  # m2's leftover is reported, m1's is not repeated onto it
+    assert "superseded_unresolved" not in batch["results"]["m1"]
+    assert batch["results"]["m2"]["superseded_unresolved"] == ["ep-B"]
+
+
+# ── review round 8: overlapping enrichments of one memory retire against the row's current reference ──
+
+
+def test_an_enrichment_retires_the_episode_a_concurrent_enrichment_recorded_meanwhile(service, monkeypatch):
+    """Two jobs of one memory (the graph worker runs several at once) both read ``ep-0``; the faster one
+    records ``ep-A``.  Before: the slower one overwrote ``ep-A`` with its own reference having retired only
+    ``ep-0``, leaving ``ep-A`` in the graph with no row pointing at it."""
+    monkeypatch.setattr(settings, "graph_support_aware_removal_enabled", True)
+    state = {"ref": "ep-0"}
+    service._memory.get.side_effect = lambda memory_id: {
+        "memory": "t", "user_id": "u", "metadata": {"owner_user_id": "u", "visibility": "private",
+                                                    "graph_episode_uuid": state["ref"]}}
+
+    def slow_add(**kw):
+        state["ref"] = "ep-A"  # the other job recorded its episode while this one extracted
+        return {"episode_uuid": "ep-N", "episode_name": "n"}
+
+    service._memory.graph.add.side_effect = slow_add
+    monkeypatch.setattr(service, "_attach_memory_id_to_graph_nodes", lambda **kw: None)
+    monkeypatch.setattr(service, "_persist_graph_episode_ref", lambda *a: None)
+    monkeypatch.setattr(service, "_maybe_supersede_contradicted", lambda **kw: None)
+    retired = []
+    monkeypatch.setattr(service, "_retire_episodes", lambda ids, uuids, owner_user_id=None: retired.append(uuids) or [])
+    assert service.enrich_graph(content="t", user_id="u", project_id=None, visibility="private", memory_id="m1")
+    assert retired == [["ep-0", "ep-A"]]

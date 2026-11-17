@@ -785,6 +785,9 @@ def install_usage_capture(settings: Any = None) -> _SqlUsageStore | None:
     return store
 
 
+SHUTDOWN_DRAIN_BUDGET_S = 5.0  # the whole shutdown drain of pending gaps, not one gap
+
+
 def uninstall_usage_capture(store: _SqlUsageStore | None) -> None:
     """Flush pending gaps, remove the recorder and close the store (best effort, never raises)."""
     if store is None:
@@ -793,10 +796,19 @@ def uninstall_usage_capture(store: _SqlUsageStore | None) -> None:
 
     try:
         recorder = usage_capture.get_usage_recorder()
+        # One deadline for the whole drain (waiting for a running cycle and flushing what is left): per-gap
+        # budgets would add up to minutes for many pending gaps, outside the service's shutdown timeout.
+        deadline = time.monotonic() + SHUTDOWN_DRAIN_BUDGET_S
         if hasattr(recorder, "wait_gap_flush"):
-            recorder.wait_gap_flush(timeout=5.0)  # a background cycle may hold claimed counts
+            recorder.wait_gap_flush(timeout=max(0.0, deadline - time.monotonic()))  # a cycle may hold claimed counts
         if hasattr(recorder, "flush_gaps"):
-            recorder.flush_gaps()
+            recorder.flush_gaps(max_s=max(0.0, deadline - time.monotonic()))
+        left = dict(getattr(recorder, "unrecorded", None) or {})
+        if left:
+            logger.error(
+                "usage gaps left unpersisted at shutdown (their task counts are lost)",
+                tasks=len(left), events=sum(left.values()),
+            )
     except Exception:
         pass
     usage_capture.set_usage_recorder(None)

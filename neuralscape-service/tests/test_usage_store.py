@@ -523,4 +523,5 @@ def test_the_recorder_stays_inside_its_budget_while_another_connection_holds_a_r
     assert store._conn.execute("PRAGMA busy_timeout").fetchone()[0] == 30_000  # restored after the bounded waits
     attempts.clear()
     assert recorder.record(event("e2", task="task-1")) is True  # the lock is gone: stored, and the gap flushed
+    assert recorder.wait_gap_flush(timeout=5.0)  # the flush runs on a background thread: wait for it, then look
     assert recorder.unrecorded == {} and store.gaps(TENANT, "task-1") == 1

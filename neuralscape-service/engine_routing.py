@@ -626,6 +626,7 @@ class EngineRouter:
         if source is not None:
             for state in source.states():
                 self._copy_state(shadow, state, report)
+            report.skipped = int(getattr(source, "skipped", 0) or 0)
             with self._state_lock:
                 self._needs_canonical_sync = False
         self._cursors.set(self._cursor_name, self._journal.head())

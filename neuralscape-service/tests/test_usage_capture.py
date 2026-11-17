@@ -645,3 +645,47 @@ def test_the_store_signature_is_read_once_per_method_not_on_every_write(monkeypa
     assert call(store.legacy, "e", budget_s=0.5) == "legacy"
     assert call(store.append, "e") is None  # no budget asked for: none passed
     assert len(reads) == 2  # one read per method, however many writes
+
+
+def test_the_shutdown_drain_is_bounded_as_a_whole_and_reports_what_it_left(monkeypatch):
+    """Before: the shutdown flush gave every pending gap its own write budget, so many pending gaps could
+    take minutes, outside the service's shutdown timeout, and nothing said what stayed unpersisted."""
+    import time
+
+    import usage_capture
+    import usage_store
+    from usage_capture import DurableUsageRecorder
+
+    class SlowStore:
+        closed = False
+
+        def record_gap(self, tenant_id, task_id, count):
+            time.sleep(0.15)
+
+        def close(self):
+            self.closed = True
+
+    store = SlowStore()
+    recorder = DurableUsageRecorder(store)
+    for index in range(40):  # 40 gaps at 0.15 s each is 6 s of writes
+        recorder._unrecorded[("t", f"task-{index}")] = 2
+    monkeypatch.setattr(usage_store, "SHUTDOWN_DRAIN_BUDGET_S", 0.6)
+    logged = []
+
+    class Log:
+        def error(self, message, *args, **kwargs):
+            logged.append((message, kwargs))
+
+    monkeypatch.setattr(usage_store, "logger", Log())
+    usage_capture.set_usage_recorder(recorder)
+    started = time.monotonic()
+    try:
+        usage_store.uninstall_usage_capture(store)
+    finally:
+        usage_capture.set_usage_recorder(None)
+    assert time.monotonic() - started < 1.5
+    left = recorder.unrecorded
+    assert 0 < len(left) < 40 and sum(left.values()) == 2 * len(left)  # counts not reached are kept, none dropped
+    assert store.closed
+    (message, fields), = logged
+    assert "unpersisted" in message and fields["tasks"] == len(left) and fields["events"] == 2 * len(left)

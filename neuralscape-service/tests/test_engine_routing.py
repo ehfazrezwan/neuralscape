@@ -648,3 +648,17 @@ def test_backfill_is_refused_while_a_window_is_open():
     router.begin_dual_write(Backend("b", ReferenceVectorStore("b")))
     with pytest.raises(RoutingError):
         router.backfill(Canonical())
+
+
+def test_catch_up_reports_the_keys_its_canonical_source_could_not_read():
+    """Before: backfill copied ``source.skipped`` into the report and catch-up did not, so a dual-write
+    catch-up reported ``skipped == 0`` for keys no projection was written for."""
+    router, a, b = make()
+    router.apply(router.route(), ctx(), rec("old", 1, "before window"))
+    router.begin_dual_write(Backend("b", b))
+
+    class Source(Canonical):
+        skipped = 2
+
+    report = router.catch_up(Source(CanonicalState("tenant-a", "old", 1, False, "before window")))
+    assert report.skipped == 2

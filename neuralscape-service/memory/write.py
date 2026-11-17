@@ -1462,6 +1462,14 @@ class WriteMixin:
             # the graph result.
             episode_uuid = (graph_result or {}).get("episode_uuid")
             episode_name = (graph_result or {}).get("episode_name")
+            if support_aware and (episode_uuid or episode_name):
+                # Another enrichment of this memory may have recorded its episode while this one extracted
+                # (the graph worker runs several jobs at once): retire against the row's reference as it is
+                # NOW, not only the one read before the write, or the other job's episode is left behind with
+                # nothing pointing at it.  (The window that remains is the time between this read and the write.)
+                current = self._previous_graph_episodes(memory_id)
+                if current is not None:
+                    previous_episodes = list(dict.fromkeys([*previous_episodes, *current[0]]))
             if episode_uuid or episode_name:
                 self._persist_graph_episode_ref(memory_id, episode_uuid, episode_name)
             if (
@@ -1531,11 +1539,24 @@ class WriteMixin:
 
         try:
             row = self._memory.get(memory_id) or {}
-            metadata = row.get("metadata", {}) or {}
-            if isinstance(metadata.get("metadata"), dict):
-                metadata = metadata["metadata"]
+            outer = row.get("metadata", {}) or {}
+            metadata = outer["metadata"] if isinstance(outer.get("metadata"), dict) else outer
             superseded = metadata.get(SUPERSEDED_EPISODES_KEY)
-            values = [metadata.get("graph_episode_uuid"), *(superseded if isinstance(superseded, list) else [])]
+            # The episode reference is written at the outer depth (``_persist_graph_episode_ref``), also on a
+            # wrapped row: look at both.  A row that recorded only the episode's name (no uuid) is resolved
+            # to its episode here, so the correction retires it; a lookup that fails defers the enrichment
+            # (the reference is kept), a name no episode carries any more leaves nothing to retire.
+            ref_uuid = outer.get("graph_episode_uuid") or metadata.get("graph_episode_uuid")
+            ref_name = outer.get("graph_episode_name") or metadata.get("graph_episode_name")
+            if not ref_uuid and ref_name and isinstance(ref_name, str):
+                owner = metadata.get("owner_user_id") or row.get("user_id", "")
+                group = _build_group_id(
+                    metadata.get("visibility") or MemoryVisibility.PRIVATE.value, owner,
+                    metadata.get("project_id"), metadata.get("workspace"),
+                )
+                found = self._lookup_episode(group, "name", ref_name, fail_closed=True)
+                ref_uuid = found["uuid"] if found else None
+            values = [ref_uuid, *(superseded if isinstance(superseded, list) else [])]
             episodes = list(dict.fromkeys(v for v in values if isinstance(v, str) and v))
             return episodes, bool(metadata.get(REENRICH_PENDING_KEY))
         except Exception:
