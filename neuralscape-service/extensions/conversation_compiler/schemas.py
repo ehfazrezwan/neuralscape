@@ -52,22 +52,26 @@ class CompileResult(BaseModel):
     date: str
     articles: list[CompiledArticle] = Field(default_factory=list)
     entries_compiled: int = 0
-    # True only when post-compile dedup ran for every user and skipped nothing (no unreachable
-    # lock store, no held or lost pool lock). False with
-    # ``dedup_skipped_reason`` set: it ran, but part of it was skipped (see the fields below).
+    # True only when post-compile dedup ran for every user and skipped nothing: False when
+    # ``dedup_skipped`` or any of the three pool-lock counters below is non-zero, or when a
+    # user's dedup run raised (that user's counters are then not included in this result).
+    # ``dedup_exact_groups_abandoned`` alone does not change it.
     dedup_triggered: bool = False
     # Exact groups + semantic pages dedup skipped because its lock store (Redis) did not
     # answer, summed over the users; nothing destructive runs unlocked.
     dedup_skipped: int = 0
     # Exact groups dedup abandoned (survivor changed under the lock, or lock store down).
+    # Informational: on its own it neither clears ``dedup_triggered`` nor sets a reason.
     dedup_exact_groups_abandoned: int = 0
     # Pools dedup skipped because a running sweep holds their dream lock (exact / semantic
     # phase), and pools it abandoned because the lock was lost mid-work; summed over the users.
     dedup_exact_skipped_locked_pools: int = 0
     dedup_semantic_skipped_locked_pools: int = 0
     dedup_lock_lost_pools: int = 0
-    # Short reason when any of the above is non-zero: "lock store unreachable" when
-    # ``dedup_skipped`` > 0 (it wins when both causes occur), else "dream lock held or lost".
+    # Set when ``dedup_skipped`` or a pool-lock counter above is non-zero: "lock store
+    # unreachable" when ``dedup_skipped`` > 0 (it wins when both causes occur), else
+    # "dream lock held or lost". None otherwise, including when only
+    # ``dedup_exact_groups_abandoned`` is non-zero.
     dedup_skipped_reason: Optional[str] = None
     # Sibling re-ingests the post-compile dedup produced (see MemoryService.dedup_memories)
     dedup_graph_jobs_enqueued: int = 0

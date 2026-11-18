@@ -91,7 +91,23 @@ async def test_exact_pool_held_by_a_sweep_is_reported(writer, service, redis):  
 
     got = _fields(result)
     assert got["exact"] == 1 and got["reason"] == HELD and got["triggered"] is False, got
-    assert _deleted(service) == [], "the held pool is untouched"
+    assert _deleted(service) == [] and _tombstoned(service) == [], "the held pool is untouched"
+
+
+@pytest.mark.usefixtures("dream_on_tombstone")
+@pytest.mark.asyncio
+async def test_empty_day_compile_reports_a_held_pool_too(tmp_path, service, redis):  # noqa: F811
+    """The explicit compile of a date with no entries builds its result on its own path."""
+    _pair(service)
+    assert gate.acquire_lock(redis, POOL)
+    empty = ObsidianWriter(vault_path=tmp_path / "empty-vault")
+
+    result = await compile_date(DATE, service, empty, user_id="u1")
+
+    got = _fields(result)
+    assert result.entries_compiled == 0
+    assert got["semantic"] == 1 and got["reason"] == HELD and got["triggered"] is False, got
+    assert _tombstoned(service) == [] and _deleted(service) == [], "the held pool is untouched"
 
 
 @pytest.mark.usefixtures("dream_on_tombstone")

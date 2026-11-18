@@ -28,15 +28,12 @@ DATE = "2026-11-17"
 
 
 @pytest.fixture
-def redis_client(stores, unique_ns, monkeypatch):
+def redis_client(stores, monkeypatch):
     import redis as redis_lib
 
     client = redis_lib.Redis.from_url(stores.redis_url, socket_timeout=5)
     client.ping()
     monkeypatch.setattr("extensions.dreaming.sweep._get_redis", lambda: client)
-    pools: list[str] = []
-    unique_ns.on_cleanup(lambda: [client.delete(f"dreaming:lock:{p}") for p in pools])
-    client.nsit_pools = pools  # test-owned bookkeeping: pools whose lock key must be cleared
     return client
 
 
@@ -75,6 +72,16 @@ def _tombstoned(rows, mid) -> bool:
     return mid not in rows or bool((rows[mid].get("metadata") or {}).get("dream_tombstoned"))
 
 
+def _stored_payload(svc, mid) -> dict | None:
+    """The row's payload read straight from Qdrant by id (None when the row is gone)."""
+    from config import settings
+
+    points = svc._memory.vector_store.client.retrieve(
+        collection_name=settings.qdrant_collection, ids=[mid], with_payload=True, with_vectors=False
+    )
+    return (points[0].payload or {}) if points else None
+
+
 def _compile(svc, writer, uid):
     from extensions.conversation_compiler.compile import compile_date
 
@@ -94,7 +101,6 @@ def test_compile_reports_a_pool_a_sweep_holds_and_dedups_it_once_released(
     from extensions.dreaming.config import dreaming_settings
     from memory.delete import _dream_pool_of
 
-    pytest.importorskip("fcntl")
     # dreaming off: the semantic phase runs, and dedup takes the pool lock whenever Redis answers
     monkeypatch.setattr(dreaming_settings, "enabled", False)
 
@@ -115,7 +121,6 @@ def test_compile_reports_a_pool_a_sweep_holds_and_dedups_it_once_released(
     assert not _tombstoned(rows, old_id) and not _tombstoned(rows, new_id)
     pool = _dream_pool_of(rows[old_id])
     assert pool and pool == _dream_pool_of(rows[new_id])
-    redis_client.nsit_pools.append(pool)
 
     writer = ObsidianWriter(vault_path=tmp_path / "vault")
     writer.append_daily_log(
@@ -127,23 +132,25 @@ def test_compile_reports_a_pool_a_sweep_holds_and_dedups_it_once_released(
     # a sweep holds the pool, exactly as the dream sweep takes it
     sweep_token = gate.acquire_lock(redis_client, pool)
     assert sweep_token, "the pool lock must be free before the test starts"
+    # only the lease this test took is ever released (compare-and-delete on its token)
+    unique_ns.on_cleanup(lambda: gate.release_lock(redis_client, pool, sweep_token))
 
-    held = _compile(svc, writer, uid)
+    try:
+        held = _compile(svc, writer, uid)
 
-    rows = _rows(svc, uid)
-    seen = held.model_dump(exclude={"articles"})
-    assert not _tombstoned(rows, old_id) and not _tombstoned(rows, new_id), seen
-    assert held.dedup_semantic_skipped_locked_pools == 1, seen
-    assert held.dedup_triggered is False and held.dedup_skipped_reason == "dream lock held or lost", seen
-    assert held.dedup_skipped == 0, seen  # the lock store answered: that counter keeps its meaning
-    assert redis_client.get(f"dreaming:lock:{pool}").decode() == sweep_token, "the sweep's lock is untouched"
-
-    gate.release_lock(redis_client, pool, sweep_token)
+        rows = _rows(svc, uid)
+        seen = held.model_dump(exclude={"articles"})
+        assert not _tombstoned(rows, old_id) and not _tombstoned(rows, new_id), seen
+        assert held.dedup_semantic_skipped_locked_pools == 1, seen
+        assert held.dedup_triggered is False and held.dedup_skipped_reason == "dream lock held or lost", seen
+        assert held.dedup_skipped == 0, seen  # the lock store answered: that counter keeps its meaning
+        assert redis_client.get(f"dreaming:lock:{pool}").decode() == sweep_token, "the sweep's lock is untouched"
+    finally:
+        gate.release_lock(redis_client, pool, sweep_token)
     assert redis_client.get(f"dreaming:lock:{pool}") is None
 
     done = _compile(svc, writer, uid)
 
-    rows = _rows(svc, uid)
     seen = done.model_dump(exclude={"articles"})
     assert done.dedup_triggered is True and done.dedup_skipped_reason is None, seen
     assert (
@@ -151,5 +158,8 @@ def test_compile_reports_a_pool_a_sweep_holds_and_dedups_it_once_released(
         done.dedup_semantic_skipped_locked_pools,
         done.dedup_lock_lost_pools,
     ) == (0, 0, 0), seen
-    assert _tombstoned(rows, old_id) and not _tombstoned(rows, new_id), seen
+    old_payload, new_payload = _stored_payload(svc, old_id), _stored_payload(svc, new_id)
+    assert old_payload is not None, f"the older row must still be stored (tombstone mode, not a delete): {seen}"
+    assert (old_payload.get("metadata") or {}).get("dream_tombstoned"), (old_payload, seen)
+    assert new_payload is not None and not (new_payload.get("metadata") or {}).get("dream_tombstoned"), seen
     assert redis_client.get(f"dreaming:lock:{pool}") is None, "dedup released the lock it took"

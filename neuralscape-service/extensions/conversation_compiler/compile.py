@@ -239,6 +239,27 @@ def _pools_skipped(skip: dict) -> int:
     )
 
 
+def _dedup_result_fields(ok: bool, skip: dict, enqueued: int, not_enqueued: int) -> dict:
+    """The ``CompileResult`` keyword arguments describing a post-compile dedup run.
+
+    One place for the empty-day and the normal path, so they cannot drift.
+    ``dedup_triggered`` is True only when every attempted dedup succeeded and nothing
+    was skipped (no unreachable lock store, no held or lost pool lock). A user whose
+    dedup run raised makes it False and that user's counters are not included.
+    """
+    return {
+        "dedup_triggered": ok and not skip["skipped"] and not _pools_skipped(skip),
+        "dedup_skipped": skip["skipped"],
+        "dedup_exact_groups_abandoned": skip["exact_groups_abandoned"],
+        "dedup_exact_skipped_locked_pools": skip["exact_skipped_locked_pools"],
+        "dedup_semantic_skipped_locked_pools": skip["semantic_skipped_locked_pools"],
+        "dedup_lock_lost_pools": skip["lock_lost_pools"],
+        "dedup_skipped_reason": skip["reason"],
+        "dedup_graph_jobs_enqueued": enqueued,
+        "dedup_graph_jobs_not_enqueued": not_enqueued,
+    }
+
+
 async def _dedup_compiled_users(
     service: MemoryService,
     entries: list[dict],
@@ -374,15 +395,7 @@ async def compile_date(
         )
         return CompileResult(
             date=date,
-            dedup_triggered=dedup_ok and not skip["skipped"] and not _pools_skipped(skip),
-            dedup_skipped=skip["skipped"],
-            dedup_exact_groups_abandoned=skip["exact_groups_abandoned"],
-            dedup_exact_skipped_locked_pools=skip["exact_skipped_locked_pools"],
-            dedup_semantic_skipped_locked_pools=skip["semantic_skipped_locked_pools"],
-            dedup_lock_lost_pools=skip["lock_lost_pools"],
-            dedup_skipped_reason=skip["reason"],
-            dedup_graph_jobs_enqueued=sibling_enqueued,
-            dedup_graph_jobs_not_enqueued=sibling_failed,
+            **_dedup_result_fields(dedup_ok, skip, sibling_enqueued, sibling_failed),
         )
 
     # Group entries
@@ -506,15 +519,7 @@ async def compile_date(
         date=date,
         articles=articles,
         entries_compiled=entries_compiled,
-        dedup_triggered=dedup_ok and not skip["skipped"] and not _pools_skipped(skip),
-        dedup_skipped=skip["skipped"],
-        dedup_exact_groups_abandoned=skip["exact_groups_abandoned"],
-        dedup_exact_skipped_locked_pools=skip["exact_skipped_locked_pools"],
-        dedup_semantic_skipped_locked_pools=skip["semantic_skipped_locked_pools"],
-        dedup_lock_lost_pools=skip["lock_lost_pools"],
-        dedup_skipped_reason=skip["reason"],
-        dedup_graph_jobs_enqueued=sibling_enqueued,
-        dedup_graph_jobs_not_enqueued=sibling_failed,
+        **_dedup_result_fields(dedup_ok, skip, sibling_enqueued, sibling_failed),
     )
 
     logger.info(
