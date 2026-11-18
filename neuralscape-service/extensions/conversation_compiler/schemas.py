@@ -52,7 +52,8 @@ class CompileResult(BaseModel):
     date: str
     articles: list[CompiledArticle] = Field(default_factory=list)
     entries_compiled: int = 0
-    # True only when post-compile dedup ran for every user and skipped nothing. False with
+    # True only when post-compile dedup ran for every user and skipped nothing (no unreachable
+    # lock store, no held or lost pool lock). False with
     # ``dedup_skipped_reason`` set: it ran, but part of it was skipped (see the fields below).
     dedup_triggered: bool = False
     # Exact groups + semantic pages dedup skipped because its lock store (Redis) did not
@@ -60,7 +61,13 @@ class CompileResult(BaseModel):
     dedup_skipped: int = 0
     # Exact groups dedup abandoned (survivor changed under the lock, or lock store down).
     dedup_exact_groups_abandoned: int = 0
-    # Short reason when ``dedup_skipped`` > 0 (e.g. "lock store unreachable"), else None.
+    # Pools dedup skipped because a running sweep holds their dream lock (exact / semantic
+    # phase), and pools it abandoned because the lock was lost mid-work; summed over the users.
+    dedup_exact_skipped_locked_pools: int = 0
+    dedup_semantic_skipped_locked_pools: int = 0
+    dedup_lock_lost_pools: int = 0
+    # Short reason when any of the above is non-zero: "lock store unreachable" when
+    # ``dedup_skipped`` > 0 (it wins when both causes occur), else "dream lock held or lost".
     dedup_skipped_reason: Optional[str] = None
     # Sibling re-ingests the post-compile dedup produced (see MemoryService.dedup_memories)
     dedup_graph_jobs_enqueued: int = 0

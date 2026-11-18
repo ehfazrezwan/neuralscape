@@ -221,12 +221,22 @@ def _entries_to_text(entries: list[dict]) -> str:
 
 
 _LOCK_STORE_DOWN = "lock store unreachable"
+_LOCK_HELD = "dream lock held or lost"
 
 
 def _count(result: object, key: str) -> int:
     """An int counter from a ``dedup_memories`` result (0 when absent or not a number)."""
     value = result.get(key) if isinstance(result, dict) else 0
     return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+
+def _pools_skipped(skip: dict) -> int:
+    """Pools dedup skipped or abandoned for a held or lost dream lock."""
+    return (
+        skip["exact_skipped_locked_pools"]
+        + skip["semantic_skipped_locked_pools"]
+        + skip["lock_lost_pools"]
+    )
 
 
 async def _dedup_compiled_users(
@@ -249,9 +259,14 @@ async def _dedup_compiled_users(
     One user's failure never stops the others. Returns True when every
     attempted dedup succeeded, plus the sibling graph jobs enqueued / not
     enqueued from the ``graph_jobs`` the dedup runs returned, plus the skip
-    summary (``skipped`` / ``exact_groups_abandoned`` / ``reason``) summed over
-    the users: with Redis unreachable dedup skips every pooled group and page
-    rather than run unlocked, and that must stay visible to the caller.
+    summary (``skipped`` / ``exact_groups_abandoned`` / ``reason``, plus the
+    pool counters ``exact_skipped_locked_pools`` / ``semantic_skipped_locked_pools``
+    / ``lock_lost_pools``) summed over the users: with Redis unreachable dedup
+    skips every pooled group and page rather than run unlocked, a pool whose
+    dream lock a running sweep holds is skipped, and a pool whose lock was lost
+    mid-work is abandoned; all of that must stay visible to the caller. When
+    both causes occur, ``reason`` names the unreachable lock store (the wider
+    cause); the pool counters still carry the held and lost pools.
     """
     users = {e["user_id"] for e in entries if e.get("user_id")}
     if include_requester or not users or any(not e.get("user_id") for e in entries):
@@ -259,12 +274,21 @@ async def _dedup_compiled_users(
     semantic = _semantic_dedup_enabled()
     ok = True
     enqueued = failed = 0
-    skip = {"skipped": 0, "exact_groups_abandoned": 0, "reason": None}
+    skip = {
+        "skipped": 0,
+        "exact_groups_abandoned": 0,
+        "exact_skipped_locked_pools": 0,
+        "semantic_skipped_locked_pools": 0,
+        "lock_lost_pools": 0,
+        "reason": None,
+    }
     for uid in sorted(users):
         try:
             result = await asyncio.to_thread(service.dedup_memories, uid, semantic=semantic)
             skip["skipped"] += _count(result, "lock_store_unreachable_skipped")
             skip["exact_groups_abandoned"] += _count(result, "exact_groups_abandoned")
+            for key in ("exact_skipped_locked_pools", "semantic_skipped_locked_pools", "lock_lost_pools"):
+                skip[key] += _count(result, key)
             jobs = (result or {}).get("graph_jobs") or []
             if jobs:
                 e, f = await _enqueue_sibling_jobs(jobs)
@@ -278,6 +302,14 @@ async def _dedup_compiled_users(
         logger.warning(
             "Post-compile dedup skipped work: lock store unreachable (non-critical)",
             skipped=skip["skipped"],
+        )
+    if _pools_skipped(skip):
+        skip["reason"] = skip["reason"] or _LOCK_HELD
+        logger.warning(
+            "Post-compile dedup skipped pools: dream lock held or lost (non-critical)",
+            exact_skipped_locked_pools=skip["exact_skipped_locked_pools"],
+            semantic_skipped_locked_pools=skip["semantic_skipped_locked_pools"],
+            lock_lost_pools=skip["lock_lost_pools"],
         )
     return ok, enqueued, failed, skip
 
@@ -342,9 +374,12 @@ async def compile_date(
         )
         return CompileResult(
             date=date,
-            dedup_triggered=dedup_ok and not skip["skipped"],
+            dedup_triggered=dedup_ok and not skip["skipped"] and not _pools_skipped(skip),
             dedup_skipped=skip["skipped"],
             dedup_exact_groups_abandoned=skip["exact_groups_abandoned"],
+            dedup_exact_skipped_locked_pools=skip["exact_skipped_locked_pools"],
+            dedup_semantic_skipped_locked_pools=skip["semantic_skipped_locked_pools"],
+            dedup_lock_lost_pools=skip["lock_lost_pools"],
             dedup_skipped_reason=skip["reason"],
             dedup_graph_jobs_enqueued=sibling_enqueued,
             dedup_graph_jobs_not_enqueued=sibling_failed,
@@ -471,9 +506,12 @@ async def compile_date(
         date=date,
         articles=articles,
         entries_compiled=entries_compiled,
-        dedup_triggered=dedup_ok and not skip["skipped"],
+        dedup_triggered=dedup_ok and not skip["skipped"] and not _pools_skipped(skip),
         dedup_skipped=skip["skipped"],
         dedup_exact_groups_abandoned=skip["exact_groups_abandoned"],
+        dedup_exact_skipped_locked_pools=skip["exact_skipped_locked_pools"],
+        dedup_semantic_skipped_locked_pools=skip["semantic_skipped_locked_pools"],
+        dedup_lock_lost_pools=skip["lock_lost_pools"],
         dedup_skipped_reason=skip["reason"],
         dedup_graph_jobs_enqueued=sibling_enqueued,
         dedup_graph_jobs_not_enqueued=sibling_failed,
@@ -487,6 +525,9 @@ async def compile_date(
         dedup_triggered=result.dedup_triggered,
         dedup_skipped=result.dedup_skipped,
         dedup_skipped_reason=result.dedup_skipped_reason,
+        dedup_exact_skipped_locked_pools=result.dedup_exact_skipped_locked_pools,
+        dedup_semantic_skipped_locked_pools=result.dedup_semantic_skipped_locked_pools,
+        dedup_lock_lost_pools=result.dedup_lock_lost_pools,
     )
 
     return result
