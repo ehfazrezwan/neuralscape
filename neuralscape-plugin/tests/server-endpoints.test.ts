@@ -69,7 +69,7 @@ describe("server endpoints the plugin calls", () => {
       const text = readFileSync(file, "utf-8");
       for (const m of text.matchAll(/\/v1\/[A-Za-z0-9_/{}.-]*[A-Za-z0-9_}]/g)) named.add(m[0]);
     }
-    const section = readmeSection("From the skills (REST, via curl)");
+    const section = readmeSection("From the skills (REST, via the plugin's helper)");
     const paths = documented(section).map((e) => e.split(" ")[1]).sort();
     expect(paths).toEqual([...named].sort());
   });
