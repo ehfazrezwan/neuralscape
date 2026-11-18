@@ -28,7 +28,7 @@ import time
 import httpx
 import pytest
 
-from nsaccept import eventually, expect_check_fails, guard, needs, negative_control, proves
+from nsaccept import eventually, expect_check_fails, guard, needs, negative_control, precondition, proves
 from nsaccept.client import NSClient
 from nsaccept.helpers import Written, memory_ids_in, rows_with, list_rows
 from nsaccept.runctx import container_restart_count, parse_ps_json
@@ -354,4 +354,7 @@ def test_degraded_check_fails_for_a_healthy_graph(ctx, a):
 @negative_control
 def test_health_graph_check_fails_while_neo4j_is_up(ctx):
     """The "graph store is down" expectation must fail against a healthy stack."""
+    # Precondition: /health answers 200 and reports graph_store "ok". Without it the control could
+    # pass because /health is unreachable or lacks the graph check, not because the check can tell.
+    precondition(check_health_graph_store, ctx.base_url, want_down=False, what="/health 200 with graph_store ok on the healthy stack")
     expect_check_fails(check_health_graph_store, ctx.base_url, want_down=True)
