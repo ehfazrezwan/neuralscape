@@ -12,6 +12,11 @@ through the admin route must
 A shared-group episode is removable only by the owner of the memory that references it: a second user who
 can read the shared group is refused (403) and nothing is touched.
 
+The junk-episode sweep (``DELETE /v1/graph/episodes/junk``) deletes the junk episodes the caller may delete and
+SKIPS (never aborts on) a junk episode in the shared group that another user owns, reporting it in
+``skipped_count`` / ``skipped_uuids`` -- on a dry run too, where ``junk_count`` is what a real run deletes.  The same
+episode is deleted by its owner, so the skip is the permission rule and not the episode's content.
+
 A missing store fails the test on the gate and skips it elsewhere (``integration_tests/README.md``).
 """
 
@@ -127,3 +132,85 @@ def test_reader_of_the_shared_group_cannot_delete_the_owners_episode_but_the_own
     finally:
         graphiti, bridge = graph
         q(graphiti, bridge, "MATCH (n {group_id: 'shared', name: 'nsit-shared'}) DETACH DELETE n")
+
+
+def _sweep_through_the_api(service, monkeypatch, flags, caller, dry_run):
+    from fastapi.testclient import TestClient
+
+    import main
+
+    monkeypatch.setattr(main, "_service", service)
+    flags(default_user_id=caller)
+    flags(ledger_enabled=False)
+    flags(neuralscape_auth_disabled=True)
+    flags(neuralscape_user_token_secret="")
+    flags(neuralscape_api_key="")
+    return TestClient(main.app).delete("/v1/graph/episodes/junk", params={"dry_run": "true" if dry_run else "false"})
+
+
+def _seed_junk(graph, service, *, group, memory_id, owner, visibility, name):
+    """One junk ("assistant:" log) episode in ``group`` plus the row that records its owner."""
+    import uuid as _uuid
+
+    graphiti, bridge = graph
+    episode = str(_uuid.uuid4())
+    q(graphiti, bridge, """
+        CREATE (:Episodic {uuid: $EP, group_id: $g, name: $name, content: 'assistant: nsit junk log', source: 'text',
+                           source_description: 'memory', created_at: datetime(), valid_at: datetime(),
+                           entity_edges: []})
+        """, EP=episode, g=group, name=name)
+    service._memory.put(memory_id, "assistant: nsit junk log",
+                        {"owner_user_id": owner, "visibility": visibility, "graph_episode_uuid": episode})
+    return episode
+
+
+def test_junk_sweep_skips_another_users_shared_episode_reports_it_and_still_deletes_its_own(
+    graph, rows_collection, monkeypatch, flags
+):
+    import uuid as _uuid
+
+    from memory.groups import _build_group_id
+
+    ids = seed(*graph)
+    service = make_service(graph, ids, rows_collection)
+    reader = f"nsit-sweeper-{_uuid.uuid4().hex[:8]}"
+    own_group = _build_group_id("private", reader, None, None)
+    name = f"nsit-junk-{_uuid.uuid4().hex[:8]}"
+    graphiti, bridge = graph
+    try:
+        mine = _seed_junk(graph, service, group=own_group, memory_id=str(_uuid.uuid4()), owner=reader,
+                          visibility="private", name=name)
+        theirs = _seed_junk(graph, service, group="shared", memory_id=str(_uuid.uuid4()), owner=OWNER,
+                            visibility="shared", name=name)
+
+        # Dry run: what it would delete excludes the refused episode, which is reported as skipped.
+        dry = _sweep_through_the_api(service, monkeypatch, flags, reader, dry_run=True)
+        assert dry.status_code == 200, dry.text
+        body = dry.json()
+        assert theirs in body.get("skipped_uuids", []), body
+        assert body["skipped_count"] == len(body["skipped_uuids"]) >= 1, body
+        assert mine not in body.get("skipped_uuids", []), body
+        assert body["junk_count"] >= 1 and body["breakdown"]["global"]["junk_count"] >= 1, body
+        assert exists(graph, "Episodic", mine) and exists(graph, "Episodic", theirs)  # nothing deleted yet
+
+        # Real run: its own junk is deleted, the other user's shared episode is skipped and untouched.
+        real = _sweep_through_the_api(service, monkeypatch, flags, reader, dry_run=False)
+        assert real.status_code == 200, real.text
+        body = real.json()
+        assert body["deleted_count"] == len(body["breakdown"]["global"]["deleted_uuids"]) >= 1, body
+        assert mine in body["breakdown"]["global"]["deleted_uuids"], body
+        assert theirs not in body["breakdown"]["global"]["deleted_uuids"], body
+        assert theirs in body["skipped_uuids"] and body["skipped_count"] == len(body["skipped_uuids"]), body
+        assert theirs in body["breakdown"]["global"]["skipped_uuids"], body
+        assert not exists(graph, "Episodic", mine)
+        assert exists(graph, "Episodic", theirs)
+
+        # Control: the same episode IS deleted when its owner sweeps, so the skip was the permission rule.
+        owner_run = _sweep_through_the_api(service, monkeypatch, flags, OWNER, dry_run=False)
+        assert owner_run.status_code == 200, owner_run.text
+        owner_body = owner_run.json()
+        assert theirs in owner_body["breakdown"]["global"]["deleted_uuids"], owner_body
+        assert theirs not in owner_body.get("skipped_uuids", []), owner_body
+        assert not exists(graph, "Episodic", theirs)
+    finally:
+        q(graphiti, bridge, "MATCH (n:Episodic {name: $name}) DETACH DELETE n", name=name)

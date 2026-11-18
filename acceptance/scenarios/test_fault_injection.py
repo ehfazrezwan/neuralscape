@@ -283,7 +283,33 @@ def check_graph_search_degraded(client: NSClient, project_id: str, *, want: bool
     return body
 
 
-@proves("read.search-knowledge-graph")
+HEALTH_GRAPH_BOUND_S = 8.0  # the probe is bounded at ~3 s; leave headroom for a loaded two-core host
+
+
+def check_health_graph_store(base_url: str, *, want_down: bool) -> float:
+    """/health must report the graph store truthfully. Down: HTTP 200 (never 503: that is the vector
+    store's rule), checks.graph_store "unreachable", overall "degraded", vector store still ok, answered
+    within the probe bound. Up: HTTP 200 and checks.graph_store "ok". Returns the seconds /health took."""
+    started = time.monotonic()
+    try:
+        r = httpx.get(base_url.rstrip("/") + "/health", timeout=30)
+    except httpx.TimeoutException:
+        raise AssertionError("GET /health did not answer within 30s (graph probe must be bounded)") from None
+    elapsed = time.monotonic() - started
+    body = r.json()
+    checks = body.get("checks") or {}
+    assert r.status_code == 200, f"/health -> {r.status_code} (graph store alone must not 503): {body}"
+    if want_down:
+        assert checks.get("graph_store") == "unreachable", f"graph_store={checks.get('graph_store')!r} while Neo4j is down: {checks}"
+        assert body.get("status") == "degraded", f"overall status {body.get('status')!r} while Neo4j is down: {body}"
+        assert checks.get("vector_store") == "ok", f"vector_store={checks.get('vector_store')!r}; only the graph store is down"
+        assert elapsed < HEALTH_GRAPH_BOUND_S, f"/health took {elapsed:.1f}s with Neo4j down (bound {HEALTH_GRAPH_BOUND_S}s)"
+    else:
+        assert checks.get("graph_store") == "ok", f"graph_store={checks.get('graph_store')!r} with Neo4j up: {checks}"
+    return elapsed
+
+
+@proves("read.search-knowledge-graph", "ops.health-endpoints")
 @needs("compose")
 def test_graph_search_reports_degraded_while_neo4j_is_paused(ctx, a, restore_stack):
     """DESTRUCTIVE (pauses Neo4j): needs NS_ALLOW_DESTRUCTIVE=1 and a disposable compose project."""
@@ -293,9 +319,12 @@ def test_graph_search_reports_degraded_while_neo4j_is_paused(ctx, a, restore_sta
         pytest.skip("destructive: needs a disposable compose project on the allowlist")
     if os.environ.get("NS_ALLOW_DESTRUCTIVE") != "1":
         pytest.skip("destructive: needs NS_ALLOW_DESTRUCTIVE=1")
-    check_graph_search_degraded(a, ctx.project_id, want=False)
+    check_graph_search_degraded(a, ctx.project_id, want=False)  # also initialises the graph client /health probes
+    eventually(lambda: check_health_graph_store(ctx.base_url, want_down=False), timeout=30, what="/health graph_store ok before the pause")
     ctx.compose("pause", NEO4J)
     try:
+        # Probed first, before the 30 s search timeout: /health must answer inside its own 2 s probe bound.
+        eventually(lambda: check_health_graph_store(ctx.base_url, want_down=True), timeout=30, interval=3, what="/health reports the paused graph store")
         check_graph_search_degraded(a, ctx.project_id, want=True)  # waits out the bridge timeout (~30 s)
     finally:
         # Restore loudly, without masking a failure already propagating.
@@ -312,9 +341,17 @@ def test_graph_search_reports_degraded_while_neo4j_is_paused(ctx, a, restore_sta
         if restore_error is not None:
             print(f"WARNING: neo4j restore failed while the scenario was already failing: {restore_error!r}")
     eventually(lambda: check_graph_search_degraded(a, ctx.project_id, want=False), timeout=120, what="graph search healthy again")
+    eventually(lambda: check_health_graph_store(ctx.base_url, want_down=False), timeout=60, what="/health graph_store ok again after unpause")
 
 
 @proves("read.search-knowledge-graph")
 @negative_control
 def test_degraded_check_fails_for_a_healthy_graph(ctx, a):
     expect_check_fails(check_graph_search_degraded, a, ctx.project_id, want=True)
+
+
+@proves("ops.health-endpoints")
+@negative_control
+def test_health_graph_check_fails_while_neo4j_is_up(ctx):
+    """The "graph store is down" expectation must fail against a healthy stack."""
+    expect_check_fails(check_health_graph_store, ctx.base_url, want_down=True)
