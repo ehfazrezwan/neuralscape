@@ -9,7 +9,7 @@ Bring larger content into memory: uploaded **files** (a folder or a `.zip`, or i
 
 **MCP first.** Text content — pasted, dictated, or read from a file you can open — always goes through the MCP `ingest_text` tool (or `ingest_document` when the content came from an external system and you can supply a connector `source` descriptor for provenance). Never curl text to the API.
 
-The **one sanctioned REST exception** is binary file upload: MCP cannot carry file bytes, so PDFs/Office docs/zips go to `POST /v1/ingest/files` (Claude Code only, when a service URL and `curl` are present). The server parses rich formats via Docling — you don't parse binaries yourself. That endpoint exists *because* there is no MCP equivalent; it is not a general fallback.
+The **one sanctioned REST exception** is binary file upload: MCP cannot carry file bytes, so PDFs/Office docs/zips go to `POST /v1/ingest/files` (Claude Code only, when the plugin runtime is present: `${CLAUDE_PLUGIN_ROOT}` and `node`; the URL resolves like the hooks', no env var needed). The server parses rich formats via Docling — you don't parse binaries yourself. That endpoint exists *because* there is no MCP equivalent; it is not a general fallback.
 
 For a single short fact, use `/neuralscape:remember` instead — this skill is for documents and longer passages.
 
@@ -26,17 +26,19 @@ For a single short fact, use `/neuralscape:remember` instead — this skill is f
    - The server persists the text as a Markdown artifact (filed under user/project/category) and the memories reference it. Async by default; report that ingestion was **queued** (passages + facts land shortly). `queue_status()` shows when the ingest queue has drained.
 
 4. **File-upload path — `POST /v1/ingest/files` (Claude Code only):**
-   - Requires a service URL (`CLAUDE_PLUGIN_OPTION_URL` / `NEURALSCAPE_URL`) and `curl`. If neither is present (e.g. Claude Cowork), you **cannot** upload binaries — tell the user file upload needs the Claude Code CLI with a configured URL, and offer to ingest pasted text via the manual path instead. Never error.
+   - Needs the plugin runtime: `${CLAUDE_PLUGIN_ROOT}` set and `node` available. If not (e.g. Claude Cowork), you **cannot** upload binaries — tell the user file upload needs the Claude Code CLI with the plugin installed, and offer to ingest pasted text via the manual path instead. Never error.
+   - **No URL variable is required.** Use the plugin's helper, which resolves the service URL exactly like the hooks (explicit `URL` option → the URL baked into the plugin's `.mcp.json` → `http://localhost:8199`) and sends the configured `API_KEY` as a Bearer token. Do **not** hand-write curl and do not refuse because no URL env var is set. `node "${CLAUDE_PLUGIN_ROOT}/scripts/sync.js" print-config` shows the resolved `url` / `api_key_set` (never the key) if you need to tell the user where the upload goes.
    - **A folder:** either zip it and upload the single `.zip` (the server expands it), or upload each file. A `.zip` is expanded server-side; `__MACOSX/`, dotfiles, and nested archives are skipped automatically.
-   - Build a multipart request, one `-F files=@<path>` per file (or the zip), plus form fields:
+   - **How the helper gets its configuration.** A skill's Bash tool has no `CLAUDE_PLUGIN_ROOT` and no `CLAUDE_PLUGIN_OPTION_*` variables (the plugin runtime exports those to hooks only). Claude Code substitutes `${CLAUDE_PLUGIN_ROOT}` and the non-sensitive `${user_config.KEY}` values into this skill text when it loads it, so the commands below pass them explicitly: `--opt 'URL=${user_config.URL}' --opt 'USER_ID=${user_config.USER_ID}'`. The helper finds the baked `.mcp.json` URL from its own location. The `API_KEY` option is sensitive, so Claude Code does not substitute it into skills: the helper sends a Bearer token only when `NEURALSCAPE_API_KEY` (or `CLAUDE_PLUGIN_OPTION_API_KEY`) is set in the shell environment; against a token-protected server without it the call is refused (HTTP 401) and you should say so and use the MCP path instead. Run `print-config` to see what the helper resolved (`api_key_set` tells you whether a key is present; the key itself is never printed).
+   - One call, every file as a positional argument plus form fields as `--field 'key=value'`. Single-quote every value and path (a path containing `'` is written `'\''`), so nothing is expanded by the shell:
      ```bash
-     curl -sS -X POST "<URL>/v1/ingest/files" \
-       -H "Authorization: Bearer <API_KEY>" \  # only if an API key/token is set
-       -F "files=@/path/to/folder.zip" \
-       -F "user_id=<resolved>" \
-       -F "category=<cat>" \
-       -F "project_id=<id>"                     # omit for global scope
+     node "${CLAUDE_PLUGIN_ROOT}/scripts/sync.js" upload --opt 'URL=${user_config.URL}' --opt 'USER_ID=${user_config.USER_ID}' \
+       --field 'user_id=<resolved>' \
+       --field 'category=<cat>' \
+       --field 'project_id=<id>' \
+       '/path/to/folder.zip'                    # omit the project_id field for global scope
      ```
+   - Uploaded files are sent as they are: the helper does not redact `<private>` spans inside binary files, and sets no size cap beyond the server's own limit.
    - The response is `{"files": [{"filename", "task_id", "file_id"}], "count": N}` (HTTP 202). Each file is parsed + chunked on a dedicated ingest worker, so this won't interrupt the active session.
    - To check progress, prefer the MCP `queue_status()` tool (aggregate per-queue depths + `caught_up`). When artifact storage is enabled, the original file is retrievable at `<URL>/v1/ingest/artifacts/{file_id}`.
 
